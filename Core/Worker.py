@@ -35,8 +35,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from Utils.DatasetHandling import cargar_mnist, preprocesar, particionar_dataset
 from Utils.Fuctions import forward, backward, cross_entropy, precision
 from Utils.WeightsHandling import inicializar_pesos
-from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig
-from messageHandling import send_message, receive_message
+from Utils.Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig
+from Utils.messageHandling import send_message, receive_message
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN DEL WORKER

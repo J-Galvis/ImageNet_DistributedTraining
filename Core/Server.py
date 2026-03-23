@@ -32,8 +32,8 @@ from Utils.DatasetHandling import cargar_mnist, preprocesar, particionar_dataset
 from Utils.Fuctions import forward, backward, cross_entropy, precision, predecir
 from Utils.WeightsHandling import inicializar_pesos, actualizar_pesos
 from Utils.ModelPersistence import guardar_modelo
-from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig
-from messageHandling import send_message, receive_message
+from Utils.Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig
+from Utils.messageHandling import send_message, receive_message
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN DEL SERVIDOR
