@@ -363,6 +363,6 @@ if __name__ == "__main__":
 
     # Crear dataset y dataloader
     TRAINSET = datasets.CIFAR10(root='./data', train=True, download=True, transform=TRANSFORM)
-    TRAINLOADER = torch.utils.data.DataLoader(TRAINSET, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(), persistent_workers=(NUM_WORKERS > 0))
+    TRAINLOADER = torch.utils.data.DataLoader(TRAINSET, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=torch.cuda.is_available())
 
     start_worker()
