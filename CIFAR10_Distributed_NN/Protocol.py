@@ -87,7 +87,7 @@ class TrainingConfig:
     num_workers: int = 1
     epocas: int = 60
     learning_rate: float = 0.001
-    intervalo_log: int = 10
+    intervalo_log: int = 1
     server_host: str = 'localhost'
     server_port: int = 6000
     socket_timeout: int = 500 # segundos

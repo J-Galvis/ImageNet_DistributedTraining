@@ -1,0 +1,53 @@
+{
+  "nombre_modelo": "Google 2Workers",
+  "fecha_guardado": "2026-04-13 12:39:19",
+  "precision_test": 47.49,
+  "epocas": 50,
+  "learning_rate": 0.001,
+  "training_time_seconds": 18921.43459224701,
+  "arquitectura": {
+    "entrada": null,
+    "oculta": null,
+    "salida": null
+  },
+  "info_extra": {
+    "num_workers": 2,
+    "architecture": "CIFAR10 CNN - Distributed with Sockets",
+    "server_host": "10.138.0.4",
+    "server_port": 6000,
+    "tiempo_total_segundos": 18921.43459224701,
+    "historial_intervalo_epochs": [
+      1,
+      10,
+      20,
+      30,
+      40,
+      50
+    ],
+    "historial_intervalo_times": [
+      385.814825,
+      3781.492652,
+      7553.648806,
+      11286.136799,
+      15040.084291,
+      18820.043895
+    ],
+    "historial_intervalo_acc_test": [
+      15.0,
+      22.46,
+      20.86,
+      28.51,
+      32.44,
+      47.49
+    ],
+    "historial_intervalo_loss": [
+      2.316314,
+      1.777723,
+      1.565669,
+      1.430696,
+      1.316447,
+      1.202876
+    ],
+    "model_path": "models/_cifar10.pt"
+  }
+}
