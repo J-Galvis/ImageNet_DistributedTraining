@@ -69,7 +69,7 @@ class DistributedTrainingServer:
     con shards de ImageNet.
     """
     
-    def __init__(self, host, port, num_workers, epocas, learning_rate, hf_token, split='train'):
+    def __init__(self, host, port, num_workers, epocas, learning_rate, hf_token, split='train', shard_size=10000):
         self.host = host
         self.port = port
         self.num_workers = num_workers
@@ -93,7 +93,7 @@ class DistributedTrainingServer:
         
         # Dataset size for scheduler
         self.total_dataset_size = get_hf_split_size(split)
-        batches_per_epoch = self.total_dataset_size // (BATCH_SIZE * num_workers)
+        batches_per_epoch = 1  # 1 weight update step per epoch in this local SGD setup
         
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
@@ -110,7 +110,7 @@ class DistributedTrainingServer:
         self.worker_connected = {}
         
         # Datos sobre particiones
-        self.shard_sizes = 1000
+        self.shard_sizes = shard_size
         
         # Historial de checkpoints
         self.historial_intervalo_epochs = []
@@ -180,7 +180,9 @@ class DistributedTrainingServer:
                     learning_rate=self.learning_rate,
                     shard_size=shard_size,
                     params=params,
-                    hf_token=self.hf_token
+                    hf_token=self.hf_token,
+                    worker_id=worker_id,
+                    num_workers=self.num_workers
                 )
                 
                 # Enviar mensaje de sincronización
@@ -456,10 +458,10 @@ class DistributedTrainingServer:
             self.server_socket.close()
     
 
-def start_server(host, port, num_workers, epocas, learning_rate, hf_token, split):
+def start_server(host, port, num_workers, epocas, learning_rate, hf_token, split, shard_size):
     """Inicia el servidor de entrenamiento distribuido"""
     server = DistributedTrainingServer(
-        host, port, num_workers, epocas, learning_rate, hf_token, split
+        host, port, num_workers, epocas, learning_rate, hf_token, split, shard_size
     )
     server.setup_socket_server()
     server.wait_for_workers()
@@ -518,6 +520,12 @@ if __name__ == '__main__':
         choices=['train', 'val'],
         help=f"Split de ImageNet a usar (por defecto: {IMAGENET_SPLIT})",
     )
+    parser.add_argument(
+        "--shard-size",
+        type=int,
+        default=10000,
+        help="Tamaño de shard de datos por worker (por defecto: 10000)",
+    )
 
     args = parser.parse_args()
 
@@ -529,4 +537,5 @@ if __name__ == '__main__':
         args.lr,
         args.hf_token,
         args.split,
+        args.shard_size,
     )

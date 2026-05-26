@@ -29,18 +29,28 @@ def _default_data_dir() -> str:
     return os.path.join(root, "Data", "ImageNet")
 
 
-def _imagenet_transform() -> T.Compose:
+def _imagenet_transform(is_train: bool = False) -> T.Compose:
     """
-    Transformación estándar ImageNet: resize → center crop → tensor → normalize.
+    Transformación estándar ImageNet con aumentación para entrenamiento.
     """
-    return T.Compose(
-        [
-            T.Resize(256),
-            T.CenterCrop(IMAGE_SIZE),
-            T.ToTensor(),
-            T.Normalize(mean=_MEAN, std=_STD),
-        ]
-    )
+    if is_train:
+        return T.Compose(
+            [
+                T.RandomResizedCrop(IMAGE_SIZE),
+                T.RandomHorizontalFlip(),
+                T.ToTensor(),
+                T.Normalize(mean=_MEAN, std=_STD),
+            ]
+        )
+    else:
+        return T.Compose(
+            [
+                T.Resize(256),
+                T.CenterCrop(IMAGE_SIZE),
+                T.ToTensor(),
+                T.Normalize(mean=_MEAN, std=_STD),
+            ]
+        )
 
 
 def detect_data_source(data_dir: Optional[str] = None) -> str:
@@ -130,7 +140,7 @@ class _HFStreamDataset(IterableDataset):
         self._shard_index = shard_index
         self._num_shards = num_shards
         self._start_index = start_index
-        self._transform = _imagenet_transform()
+        self._transform = _imagenet_transform(is_train=(hf_split == "train"))
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, int]]:
         try:

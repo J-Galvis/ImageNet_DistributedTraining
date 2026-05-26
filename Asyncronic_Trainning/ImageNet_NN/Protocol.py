@@ -35,10 +35,12 @@ class MessageFromServer:
     shard_size: int
     params: Dict
     hf_token: str  # Token de HuggingFace para acceso a ImageNet
+    worker_id: int = 0
+    num_workers: int = 1
     
     def __repr__(self):
-        return (f"MessageFromServer(epoch={self.epoch}, batches={len(self.batch_ids)}, "
-                f"shard_size={self.shard_size}, init={self.init_signal}, stop={self.stop_signal})")
+        return (f"MessageFromServer(epoch={self.epoch}, worker_id={self.worker_id}, num_workers={self.num_workers}, "
+                f"batches={len(self.batch_ids)}, shard_size={self.shard_size}, init={self.init_signal}, stop={self.stop_signal})")
 
 
 @dataclass

@@ -133,29 +133,28 @@ class DistributedTrainingWorker:
             print(f"  ✓ Shard size asignado: {self.shard_size:,} imágenes")
             
             self.hf_token = message.hf_token
+            self.worker_id = message.worker_id
+            self.num_workers = message.num_workers
             
             # Actualizar parámetros del modelo
             self.update_model_params(message.params)
             print(f"  ✓ Parámetros del modelo actualizados")
             
             # Crear dataloader para el shard asignado
-            # Para simplificar, cada worker carga todo desde el principio
-            # En una implementación real, se usarían índices diferentes
-
-            print(f"  ⏳ Inicializando dataloader de ImageNet ({self.imagenet_split})...")
+            print(f"  ⏳ Inicializando dataloader de ImageNet Shard {self.worker_id}/{self.num_workers} ({self.imagenet_split})...")
             
             self.dataloader = get_imagenet_stream_dataloader(
                 split=self.imagenet_split,
                 token=self.hf_token,
                 batch_size=BATCH_SIZE,
-                shard_index=0,  # Se asignará según worker_id en el servidor
-                num_shards=1,
+                shard_index=self.worker_id,
+                num_shards=self.num_workers,
             )
             print(f"  ✓ Dataloader listo")
             
             # Enviar confirmación
             ready_msg = WorkerReadyMessage(
-                worker_id=0,  # Se asignará en el servidor
+                worker_id=self.worker_id,
                 dataset_size=self.shard_size
             )
             send_message(self.socket, ready_msg)
@@ -322,7 +321,7 @@ class DistributedTrainingWorker:
                 
                 # Crear respuesta
                 response = MessageFromWorker(
-                    worker_id=0,
+                    worker_id=self.worker_id,
                     epoch=message.epoch,
                     gradients=gradients,
                     loss=loss,
@@ -412,131 +411,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     start_worker(args.host, args.port, args.hf_token, args.split)
-    
-    epoch_count = 0
-    
-    while True:
-        try:
-            # Recibir mensaje del servidor
-            print(f"  [Worker] Esperando mensaje del servidor...")
-            message = receive_message(self.socket)
-            
-            epoch_count += 1
-            
-            print(f"  ✓ Recibido: epoch={message.epoch}, init={message.init_signal}, "
-                f"stop={message.stop_signal}, batches={len(message.batch_ids)}")
-            
-            # ┌─── HANDSHAKE: Responder a mensaje de sincronización ───┐
-            if message.init_signal and message.epoch == 0:
-                # Ya manejado en wait_for_initialization
-                continue
-            # └─────────────────────────────────────────────────┘
-            
-            # Actualizar parámetros del modelo
-            self.update_model_params(message.params)
-            print(f"    → Parámetros del modelo actualizados (epoch {message.epoch})")
-            
-            # Entrenar
-            gradients, loss, accuracy, train_time = self.train_epoch(message.batch_ids)
-            
-            # Crear respuesta
-            response = MessageFromWorker(
-                worker_id=0,
-                epoch=message.epoch,
-                gradients=gradients,
-                loss=loss,
-                accuracy=accuracy,
-                training_time=train_time
-            )
-            
-            # Enviar gradientes
-            print(f"    → Enviando gradientes...")
-            send_message(self.socket, response)
-            print(f"    ✓ Gradientes enviados")
-            
-            # Verificar stop signal
-            if message.stop_signal:
-                print(f"\n  ✓ Stop signal recibido. Terminando worker.")
-                break
-            
-        except ConnectionError as e:
-            print(f"\n  ✗ Conexión perdida con servidor: {e}")
-            break
-        except socket.timeout:
-            print(f"\n  ✗ Timeout esperando mensaje del servidor")
-            break
-        except Exception as e:
-            print(f"\n  ✗ Error en bucle de entrenamiento: {e}")
-            import traceback
-            traceback.print_exc()
-            break
-
-def shutdown(self):
-    """Cierra la conexión."""
-    if self.socket:
-        try:
-            self.socket.close()
-        except:
-            pass
-
-
-def start_worker():
-    """Inicia el worker de entrenamiento distribuido"""
-    worker = DistributedTrainingWorker(SERVER_HOST, SERVER_PORT)
-    
-    try:
-        worker.connect_to_server()
-        worker.wait_for_initialization()
-        worker.training_loop()
-    
-    except Exception as e:
-        print(f"\n✗ Error en worker: {e}")
-    finally:
-        worker.shutdown()
-        print("\nWorker desconectado")
-
-
-if __name__ == "__main__":
-        # permitir pasar parámetros por línea de comandos para el servidor
-    parser = argparse.ArgumentParser(
-        description="Worker para entrenamiento distribuido."
-    )
-
-    parser.add_argument(
-        "--host",
-        "-H",
-        default=SERVER_HOST,
-        help=f"Host del servidor (por defecto: {SERVER_HOST})",
-    )
-    parser.add_argument(
-        "--port",
-        "-p",
-        type=int,
-        default=SERVER_PORT,
-        help=f"Puerto del servidor (por defecto: {SERVER_PORT})",
-    )
-    parser.add_argument(
-        "--particiones",
-        "-n",
-        type=int,
-        default=NUM_WORKERS,
-        help=f"Número de particiones/datos (por defecto: {NUM_WORKERS})",
-    )
-
-    
-    args = parser.parse_args()
-    SERVER_HOST = args.host
-    SERVER_PORT = args.port
-    NUM_WORKERS = args.particiones
-
-    # Definir TRANSFORM localmente
-    TRANSFORM = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
-    ])
-
-    # Crear dataset y dataloader
-    TRAINSET = datasets.CIFAR10(root='./data', train=True, download=True, transform=TRANSFORM)
-    TRAINLOADER = torch.utils.data.DataLoader(TRAINSET, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=torch.cuda.is_available())
-
-    start_worker()
