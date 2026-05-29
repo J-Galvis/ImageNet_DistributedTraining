@@ -68,7 +68,7 @@ class Net(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.normal_(m.weight, 0, (1.0/512)**0.5)
                 nn.init.constant_(m.bias, 0)
     
     def forward(self, x):

@@ -169,7 +169,8 @@ class DistributedTrainingServer:
         for worker_id in range(self.num_workers):
             try:
                 # Crear mensaje de sincronización (epoch=0, init_signal=True)
-                params = {name: param.data.cpu().numpy() for name, param in self.net.named_parameters()}
+                # Bug #2 fix: send full state_dict (includes BN running_mean/var buffers)
+                params = {name: tensor.cpu().numpy() for name, tensor in self.net.state_dict().items()}
                 shard_size = self.shard_sizes
                 
                 message = MessageFromServer(
@@ -213,7 +214,7 @@ class DistributedTrainingServer:
         
         print(f"  ✓ Todos los workers sincronizados y listos para entrenar")
     
-    def distribute_work(self, epoch):
+    def distribute_work(self, epoch, is_last_epoch=False):
         """
         Distribuye trabajo a todos los workers para una época.
         
@@ -237,14 +238,14 @@ class DistributedTrainingServer:
                 end_batch = start_batch + batches_per_worker if worker_id < self.num_workers - 1 else num_batches
                 batch_ids = list(range(start_batch, end_batch))
                 
-                # Obtener parámetros actuales del modelo
-                params = {name: param.data.cpu().numpy() for name, param in self.net.named_parameters()}
+                # Bug #2 fix: send full state_dict (includes BN running_mean/var buffers)
+                params = {name: tensor.cpu().numpy() for name, tensor in self.net.state_dict().items()}
                 
                 message = MessageFromServer(
                     batch_ids=batch_ids,
                     epoch=epoch,
                     init_signal=True,
-                    stop_signal=False,
+                    stop_signal=is_last_epoch,  # Bug #5 fix: True on final epoch
                     learning_rate=self.learning_rate,
                     shard_size=shard_size,
                     params=params,
@@ -351,6 +352,43 @@ class DistributedTrainingServer:
         self.optimizer.step()
         self.scheduler.step()
     
+    def apply_worker_buffers(self, messages_list):
+        """
+        Bug #2 fix: average BN running stats from all workers and apply to the
+        server model so that saved checkpoints have correct normalization for eval.
+        
+        running_mean / running_var  → averaged across workers.
+        num_batches_tracked          → taken from worker 0 (it's a counter, not a stat).
+        """
+        all_bufs = [msg.buffers for msg in messages_list if getattr(msg, 'buffers', None)]
+        if not all_bufs or not all_bufs[0]:
+            return  # workers didn't send buffers (old protocol) — skip silently
+        
+        current_state = self.net.state_dict()
+        new_state = dict(current_state)  # shallow copy; we'll replace BN entries
+        
+        for buf_name in all_bufs[0].keys():
+            buf_arrays = [b[buf_name] for b in all_bufs if buf_name in b]
+            if not buf_arrays:
+                continue
+            
+            target = current_state.get(buf_name)
+            if target is None:
+                continue
+            
+            if 'num_batches_tracked' in buf_name:
+                # Counter — just take the value from the first worker
+                merged = torch.tensor(buf_arrays[0], dtype=target.dtype, device=target.device)
+            else:
+                # running_mean / running_var — average across workers
+                avg = sum(buf_arrays) / len(buf_arrays)
+                merged = torch.tensor(avg, dtype=target.dtype, device=target.device)
+            
+            new_state[buf_name] = merged
+        
+        self.net.load_state_dict(new_state)
+        print(f"    ℹ Server: BN running stats sincronizadas desde {len(all_bufs)} workers")
+    
     def evaluate_global_model(self, epoch, tiempo_actual, avg_loss):
         """
         Evalúa el modelo global y guarda métricas en historial.
@@ -384,9 +422,10 @@ class DistributedTrainingServer:
         try:
             for epoch in range(1, self.epocas + 1):
                 epoch_start = time.time()
+                is_last = (epoch == self.epocas)
                 
-                # Distribuir trabajo
-                self.distribute_work(epoch)
+                # Distribuir trabajo — Bug #5 fix: send stop_signal on final epoch
+                self.distribute_work(epoch, is_last_epoch=is_last)
                 
                 # Recolectar resultados
                 messages = self.collect_results()
@@ -396,8 +435,11 @@ class DistributedTrainingServer:
                 avg_loss = sum(msg.loss for msg in messages) / len(messages) if messages else 0.0
                 avg_acc = sum(msg.accuracy for msg in messages) / len(messages) if messages else 0.0
                 
-                # Actualizar modelo
+                # Actualizar pesos con gradientes promediados
                 self.update_model(avg_grads)
+                
+                # Bug #2 fix: sincronizar BN running stats desde los workers
+                self.apply_worker_buffers(messages)
                 
                 epoch_time = time.time() - epoch_start
                 total_time = time.time() - training_start

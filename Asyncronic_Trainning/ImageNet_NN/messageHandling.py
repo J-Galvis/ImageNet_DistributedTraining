@@ -110,7 +110,12 @@ def send_message(sock, message, compression_threshold=5_000_000, compression_lev
                 'accuracy': message.accuracy,
                 'training_time': message.training_time,
             })
-            gradients = message.gradients
+            # Merge gradients + BN buffers into one payload.
+            # Buffer keys are prefixed with '__buf__' to distinguish them.
+            combined = dict(message.gradients)
+            for k, v in getattr(message, 'buffers', {}).items():
+                combined[f'__buf__{k}'] = v
+            gradients = combined
         elif hasattr(message, 'dataset_size'):  # WorkerReadyMessage
             metadata.update({
                 'worker_id': message.worker_id,
@@ -118,6 +123,8 @@ def send_message(sock, message, compression_threshold=5_000_000, compression_lev
             })
             gradients = {}
         else:  # MessageFromServer
+            # Bug #1 fix: include worker_id and num_workers so workers can
+            # create correctly-sharded dataloaders.
             metadata.update({
                 'batch_ids': message.batch_ids,
                 'epoch': message.epoch,
@@ -125,7 +132,9 @@ def send_message(sock, message, compression_threshold=5_000_000, compression_lev
                 'stop_signal': message.stop_signal,
                 'learning_rate': message.learning_rate,
                 'shard_size': message.shard_size,
-                'hf_token': message.hf_token
+                'hf_token': message.hf_token,
+                'worker_id': getattr(message, 'worker_id', 0),
+                'num_workers': getattr(message, 'num_workers', 1),
             })
             gradients = message.params if hasattr(message, 'params') else {}
         
@@ -195,13 +204,18 @@ def receive_message(sock, verbose=False):
         from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage
         
         if metadata['type'] == 'MessageFromWorker':
+            # Split the combined payload back into gradients and BN buffers.
+            raw = gradients
+            grads = {k: v for k, v in raw.items() if not k.startswith('__buf__')}
+            bufs  = {k[7:]: v for k, v in raw.items() if k.startswith('__buf__')}
             message = MessageFromWorker(
                 worker_id=metadata['worker_id'],
                 epoch=metadata['epoch'],
-                gradients=gradients,
+                gradients=grads,
                 loss=metadata['loss'],
                 accuracy=metadata['accuracy'],
-                training_time=metadata['training_time']
+                training_time=metadata['training_time'],
+                buffers=bufs,
             )
         elif metadata['type'] == 'WorkerReadyMessage':
             message = WorkerReadyMessage(
@@ -209,6 +223,7 @@ def receive_message(sock, verbose=False):
                 dataset_size=metadata['dataset_size']
             )
         else:  # MessageFromServer
+            # Bug #1 fix: restore worker_id and num_workers from metadata.
             message = MessageFromServer(
                 batch_ids=metadata['batch_ids'],
                 epoch=metadata['epoch'],
@@ -217,7 +232,9 @@ def receive_message(sock, verbose=False):
                 learning_rate=metadata['learning_rate'],
                 shard_size=metadata['shard_size'],
                 params=gradients,
-                hf_token=metadata['hf_token']
+                hf_token=metadata['hf_token'],
+                worker_id=metadata.get('worker_id', 0),
+                num_workers=metadata.get('num_workers', 1),
             )
         
         return message

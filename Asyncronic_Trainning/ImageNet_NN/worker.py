@@ -78,7 +78,14 @@ class DistributedTrainingWorker:
         self.net.to(self.device)
         
         # Para AMP (Automatic Mixed Precision)
-        self.scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+        # Bug #3 fix: create a single persistent optimizer for GradScaler.unscale_().
+        # A new SGD was previously created each batch, corrupting the scaler state.
+        if torch.cuda.is_available():
+            self.scaler = torch.cuda.amp.GradScaler()
+            self._amp_optimizer = torch.optim.SGD(self.net.parameters(), lr=0.0)
+        else:
+            self.scaler = None
+            self._amp_optimizer = None
         
         print(f"Worker inicializado para ImageNet ({imagenet_split})")
     
@@ -166,16 +173,26 @@ class DistributedTrainingWorker:
     
     def update_model_params(self, params_dict):
         """
-        Actualiza los parámetros del modelo desde el servidor.
+        Carga el state_dict completo recibido del servidor.
         
-        Parámetros:
-            params_dict: Dict con parámetros en formato numpy
+        Bug #2 fix: the original code used named_parameters() which skips
+        BatchNorm buffers (running_mean, running_var). We now load the full
+        state_dict so BN buffers are also synchronised from the server.
         """
         with torch.no_grad():
-            for name, param in self.net.named_parameters():
+            current_state = self.net.state_dict()
+            new_state = {}
+            for name, current_val in current_state.items():
                 if name in params_dict:
-                    param_data = torch.tensor(params_dict[name], dtype=param.dtype, device=param.device)
-                    param.data = param_data
+                    new_state[name] = torch.tensor(
+                        params_dict[name],
+                        dtype=current_val.dtype,
+                        device=current_val.device
+                    )
+                else:
+                    # Keep the local value for any key the server didn't send
+                    new_state[name] = current_val
+            self.net.load_state_dict(new_state)
     
     def compute_accuracy(self, outputs, labels):
         """Calcula la precisión"""
@@ -194,7 +211,7 @@ class DistributedTrainingWorker:
             num_batches: Número de batches a procesar
         
         Retorna:
-            (gradients_dict, avg_loss, avg_accuracy, training_time)
+            (gradients_dict, avg_loss, avg_accuracy, training_time, buffers_dict)
         """
         print(f"    Entrenando con {num_batches} batches de ImageNet...")
         
@@ -218,31 +235,39 @@ class DistributedTrainingWorker:
                 labels = labels.to(self.device, non_blocking=True)
                 
                 self.net.zero_grad()
+                valid_grads = True  # will be set False on AMP overflow
                 
-                # Forward pass
+                # ── Forward + backward ────────────────────────────────────
                 if self.scaler is not None:
+                    # Bug #3 fix: use the persistent _amp_optimizer (not a new SGD
+                    # each batch) and always call scaler.update() to keep the loss
+                    # scale from drifting to zero.
                     with torch.cuda.amp.autocast():
                         outputs = self.net(inputs)
                         loss = self.criterion(outputs, labels)
-                    
-                    # Backward pass
                     self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self._amp_optimizer)
                     
-                    # Unscale para acumulación
-                    dummy_optimizer = torch.optim.SGD(self.net.parameters(), lr=0.01)
-                    self.scaler.unscale_(dummy_optimizer)
+                    # Check for Inf/NaN before accumulating
+                    valid_grads = all(
+                        p.grad is None or torch.isfinite(p.grad).all()
+                        for p in self.net.parameters()
+                    )
+                    self.scaler.update()  # always call — adjusts scale factor
                 else:
                     outputs = self.net(inputs)
                     loss = self.criterion(outputs, labels)
                     loss.backward()
+                # ─────────────────────────────────────────────────────────
                 
-                # Acumular gradientes
-                for name, param in self.net.named_parameters():
-                    if param.grad is not None:
-                        if name not in accumulated_grads:
-                            accumulated_grads[name] = param.grad.detach().cpu().numpy().copy()
-                        else:
-                            accumulated_grads[name] += param.grad.detach().cpu().numpy()
+                # Acumular gradientes (solo si no hubo overflow en AMP)
+                if valid_grads:
+                    for name, param in self.net.named_parameters():
+                        if param.grad is not None:
+                            if name not in accumulated_grads:
+                                accumulated_grads[name] = param.grad.detach().cpu().numpy().copy()
+                            else:
+                                accumulated_grads[name] += param.grad.detach().cpu().numpy()
                 
                 # Acumular métricas
                 total_loss += loss.item()
@@ -264,9 +289,7 @@ class DistributedTrainingWorker:
         avg_loss = total_loss / batch_count if batch_count > 0 else 0.0
         avg_accuracy = total_accuracy / num_samples if num_samples > 0 else 0.0
         
-        # 🔧 FIX 1: Normalizar gradientes acumulados por número de batches
-        # Los gradientes se suman en el loop pero deben ser divididos por batch_count
-        # para evitar que tengan magnitudes enormes que causen inestabilidad en el entrenamiento
+        # Normalizar gradientes acumulados por número de batches
         if batch_count > 0:
             for name in accumulated_grads.keys():
                 accumulated_grads[name] = accumulated_grads[name] / batch_count
@@ -277,9 +300,17 @@ class DistributedTrainingWorker:
             avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
             print(f"    ℹ Gradient norm promedio: {avg_grad_norm:.6f} (normalizado por {batch_count} batches)")
         
+        # Bug #2 fix: collect updated BN running stats to send back to server.
+        # These are buffers (not parameters) and won't appear in accumulated_grads.
+        buffers = {
+            name: tensor.cpu().numpy()
+            for name, tensor in self.net.state_dict().items()
+            if 'running_mean' in name or 'running_var' in name or 'num_batches_tracked' in name
+        }
+        
         print(f"    ✓ Entrenamiento completado: Loss={avg_loss:.4f}, Acc (train)={avg_accuracy:.2f}%")
         
-        return accumulated_grads, avg_loss, avg_accuracy, tiempo_entrenamiento
+        return accumulated_grads, avg_loss, avg_accuracy, tiempo_entrenamiento, buffers
     
     def training_loop(self):
         """
@@ -317,16 +348,17 @@ class DistributedTrainingWorker:
                 print(f"    → Parámetros del modelo actualizados (epoch {message.epoch})")
                 
                 # Entrenar con los batches asignados
-                gradients, loss, accuracy, train_time = self.train_epoch(num_batches_to_process)
+                gradients, loss, accuracy, train_time, buffers = self.train_epoch(num_batches_to_process)
                 
-                # Crear respuesta
+                # Crear respuesta — include BN buffers for server-side sync (Bug #2)
                 response = MessageFromWorker(
                     worker_id=self.worker_id,
                     epoch=message.epoch,
                     gradients=gradients,
                     loss=loss,
                     accuracy=accuracy,
-                    training_time=train_time
+                    training_time=train_time,
+                    buffers=buffers,
                 )
                 
                 # Enviar gradientes

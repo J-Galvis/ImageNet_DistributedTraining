@@ -25,6 +25,7 @@ def guardar_modelo(W1, b1, W2, b2, nombre_modelo, precision_test=None,
     """
     # Crear la carpeta si no existe
     os.makedirs(CARPETA_MODELOS, exist_ok=True)
+    os.makedirs(CARPETA_STATS, exist_ok=True)
 
     # Nombre de los archivos
     nombre_archivo_pkl = f"{nombre_modelo}.pkl"

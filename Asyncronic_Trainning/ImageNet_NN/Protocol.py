@@ -6,7 +6,7 @@ Define la estructura de los mensajes intercambiados entre Server y Workers
 mediante sockets y pickle para entrenamiento con ImageNet en modo shards.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict
 import numpy as np
 
@@ -62,6 +62,7 @@ class MessageFromWorker:
     loss: float
     accuracy: float
     training_time: float
+    buffers: Dict = field(default_factory=dict)  # BN running stats (running_mean, running_var)
     
     def __repr__(self):
         return (f"MessageFromWorker(worker_id={self.worker_id}, epoch={self.epoch}, "
@@ -93,7 +94,7 @@ class TrainingConfig:
     """Configuración global de entrenamiento distribuido para ImageNet."""
     num_workers: int = 1
     epocas: int = 10
-    learning_rate: float = 0.001
+    learning_rate: float = 0.01
     intervalo_log: int = 1
     server_host: str = 'localhost'
     server_port: int = 6000
