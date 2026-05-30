@@ -69,6 +69,7 @@ class DistributedTrainingWorker:
         self.worker_id = None
         self.shard_size = None
         self.dataloader = None
+        self.dataloader_iter = None
         self.global_batch_index = 0  # Track total batches processed globally
         
         # Socket
@@ -148,8 +149,17 @@ class DistributedTrainingWorker:
             self.update_model_params(message.params)
             print(f"  ✓ Parámetros del modelo actualizados")
             
-            # Note: Dataloader will be created fresh for each step with proper start_index
-            print(f"  ✓ Dataloader will be created per-step with resumable start_index")
+            # Crear dataloader para el shard asignado (una sola vez)
+            print(f"  ⏳ Inicializando dataloader de ImageNet Shard {self.worker_id}/{self.num_workers} ({self.imagenet_split})...")
+            self.dataloader = get_imagenet_stream_dataloader(
+                split=self.imagenet_split,
+                token=self.hf_token,
+                batch_size=BATCH_SIZE,
+                shard_index=self.worker_id,
+                num_shards=self.num_workers,
+            )
+            self.dataloader_iter = iter(self.dataloader)
+            print(f"  ✓ Dataloader e iterador inicializados")
             
             # Enviar confirmación
             ready_msg = WorkerReadyMessage(
@@ -187,130 +197,100 @@ class DistributedTrainingWorker:
         total = labels.size(0)
         return 100 * correct / total
     
-    def train_epoch(self, num_batches, learning_rate):
+    def train_epoch(self, start_batch_id, num_batches, learning_rate):
         """
-        Entrena una época procesando num_batches del dataloader con actualizaciones locales.
-        
-        Realiza actualizaciones locales (Local SGD) en cada batch usando un optimizador AdamW
-        y calcula el pseudo-gradiente (diferencia entre pesos iniciales y finales)
-        normalizado por la tasa de aprendizaje.
-        
-        Parámetros:
-            num_batches: Número de batches a procesar
-            learning_rate: Tasa de aprendizaje local para la época
+        Calcula gradientes para un paso (slice de una época) compuesto por num_batches.
+        NO actualiza los pesos de forma local.
         
         Retorna:
-            (pseudo_gradients_dict, avg_loss, avg_accuracy, training_time, buffers_dict)
+            (gradients_dict, avg_loss, avg_accuracy, training_time, buffers_dict)
         """
-        print(f"    Entrenando localmente con {num_batches} batches (LR={learning_rate:.6f})...")
-        print(f"    (Resumiendo desde batch global #{self.global_batch_index})")
+        print(f"    Calculando gradientes para paso: {num_batches} batches [batch {start_batch_id}-{start_batch_id + num_batches - 1}]...")
         
         tiempo_inicio = time.time()
         
         self.net.train()
         
-        # 1. Guardar copia de los parámetros iniciales globales
-        initial_params = {
-            name: param.clone().detach()
-            for name, param in self.net.named_parameters()
-        }
-        
-        # 2. Inicializar el optimizador local para esta época
-        optimizer = torch.optim.AdamW(
-            self.net.parameters(),
-            lr=learning_rate,
-            weight_decay=1e-2,
-            betas=(0.9, 0.999),
-            eps=1e-8
-        )
-        
+        accumulated_grads = {}
         total_loss = 0.0
         total_accuracy = 0.0
         num_samples = 0
         batch_count = 0
         
-        # Create fresh dataloader starting from correct position (avoid re-resolving HF files)
-        dataloader = get_imagenet_stream_dataloader(
-            split=self.imagenet_split,
-            token=self.hf_token,
-            batch_size=BATCH_SIZE,
-            shard_index=self.worker_id,
-            num_shards=self.num_workers,
-            start_index=self.global_batch_index  # Resume from where we left off
-        )
-        
-        # Procesamiento de batches desde el dataloader
-        try:
-            for inputs, labels in dataloader:
-                if batch_count >= num_batches:
-                    break
+        for _ in range(num_batches):
+            try:
+                if self.dataloader_iter is None:
+                    self.dataloader_iter = iter(self.dataloader)
+                inputs, labels = next(self.dataloader_iter)
+            except StopIteration:
+                print("    ℹ Dataloader agotado. Reiniciando iterador.")
+                self.dataloader_iter = iter(self.dataloader)
+                inputs, labels = next(self.dataloader_iter)
                 
-                inputs = inputs.to(self.device, non_blocking=True)
-                labels = labels.to(self.device, non_blocking=True)
-                
-                optimizer.zero_grad()
-                valid_grads = True
-                
-                # ── Forward + backward + local step ──────────────────────
-                if self.scaler is not None:
-                    # En GPU con precisión mixta (AMP)
-                    with torch.cuda.amp.autocast():
-                        outputs = self.net(inputs)
-                        loss = self.criterion(outputs, labels)
-                    self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(optimizer)
-                    
-                    # Verificar overflow en AMP antes de hacer step
-                    valid_grads = all(
-                        p.grad is None or torch.isfinite(p.grad).all()
-                        for p in self.net.parameters()
-                    )
-                    
-                    if valid_grads:
-                        self.scaler.step(optimizer)
-                    self.scaler.update()
-                else:
-                    # En CPU o sin AMP
+            inputs = inputs.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
+            
+            self.net.zero_grad()
+            valid_grads = True
+            
+            # ── Forward + backward (sin optimizer.step() local) ─────────
+            if self.scaler is not None:
+                # En GPU con precisión mixta (AMP)
+                with torch.cuda.amp.autocast():
                     outputs = self.net(inputs)
                     loss = self.criterion(outputs, labels)
-                    loss.backward()
-                    optimizer.step()
-                # ─────────────────────────────────────────────────────────
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self._amp_optimizer)
                 
-                # Acumular métricas
-                total_loss += loss.item()
-                accuracy = self.compute_accuracy(outputs, labels)
-                total_accuracy += accuracy * labels.size(0)
-                num_samples += labels.size(0)
-                
-                batch_count += 1
-                self.global_batch_index += 1  # Track total batches processed
-                
-                # Mostrar progreso cada 100 batches
-                if batch_count % 100 == 0:
-                    print(f"      ... {batch_count}/{num_batches} batches procesados (Loss={loss.item():.4f})")
-        
-        except StopIteration:
-            print(f"    ⚠ Dataloader agotado antes de {num_batches} batches ({batch_count} completados)")
+                # Verificar overflow en AMP antes de acumular gradientes
+                valid_grads = all(
+                    p.grad is None or torch.isfinite(p.grad).all()
+                    for p in self.net.parameters()
+                )
+                self.scaler.update()
+            else:
+                # En CPU o sin AMP
+                outputs = self.net(inputs)
+                loss = self.criterion(outputs, labels)z
+                loss.backward()
+            # ─────────────────────────────────────────────────────────
+            
+            # Acumular gradientes (solo si no hubo overflow en AMP)
+            if valid_grads:
+                for name, param in self.net.named_parameters():
+                    if param.grad is not None:
+                        if name not in accumulated_grads:
+                            accumulated_grads[name] = param.grad.detach().cpu().numpy().copy()
+                        else:
+                            accumulated_grads[name] += param.grad.detach().cpu().numpy()
+            
+            # Acumular métricas
+            total_loss += loss.item()
+            accuracy = self.compute_accuracy(outputs, labels)
+            total_accuracy += accuracy * labels.size(0)
+            num_samples += labels.size(0)
+            
+            batch_count += 1
+            
+            # Mostrar progreso cada 100 batches
+            if batch_count % 100 == 0:
+                print(f"      ... {batch_count}/{num_batches} batches procesados (Loss={loss.item():.4f})")
         
         tiempo_entrenamiento = time.time() - tiempo_inicio
         
         avg_loss = total_loss / batch_count if batch_count > 0 else 0.0
         avg_accuracy = total_accuracy / num_samples if num_samples > 0 else 0.0
         
-        # 3. Calcular pseudo-gradientes: (W_inicial - W_final) / (learning_rate + 1e-8)
-        accumulated_grads = {}
-        with torch.no_grad():
-            for name, param in self.net.named_parameters():
-                if param.requires_grad:
-                    diff = initial_params[name] - param
-                    accumulated_grads[name] = (diff / (learning_rate + 1e-8)).cpu().numpy()
+        # Normalizar gradientes acumulados por el número de batches procesados en este paso
+        if batch_count > 0:
+            for name in accumulated_grads.keys():
+                accumulated_grads[name] = accumulated_grads[name] / batch_count
         
-        # Log de depuración: verificar magnitud de pseudo-gradientes
+        # Log de depuración: verificar magnitud de gradientes promediados
         if accumulated_grads:
             grad_norms = [np.linalg.norm(g.flatten()) for g in accumulated_grads.values() if g.size > 0]
             avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
-            print(f"    ℹ Pseudo-gradient norm promedio: {avg_grad_norm:.6f} (basado en {batch_count} actualizaciones locales)")
+            print(f"    ℹ Gradient norm promedio: {avg_grad_norm:.6f} (normalizado por {batch_count} batches)")
         
         # Sincronizar buffers de BatchNorm (running_mean, running_var)
         buffers = {
@@ -319,8 +299,8 @@ class DistributedTrainingWorker:
             if 'running_mean' in name or 'running_var' in name or 'num_batches_tracked' in name
         }
         
-        print(f"    ✓ Entrenamiento local completado: Loss={avg_loss:.4f}, Acc (train)={avg_accuracy:.2f}%")
-        
+        print(f"    ✓ Paso completado: Loss={avg_loss:.4f}, Acc (train)={avg_accuracy:.2f}%")
+
         return accumulated_grads, avg_loss, avg_accuracy, tiempo_entrenamiento, buffers
     
     def training_loop(self):
@@ -344,14 +324,17 @@ class DistributedTrainingWorker:
                 
                 epoch_count += 1
                 
-                num_batches_to_process = len(message.batch_ids)
+                # Extract batch IDs for this step
+                batch_ids = message.batch_ids
+                start_batch_id = batch_ids[0]
+                num_batches_to_process = len(batch_ids)
                 step_id = message.step_id
                 steps_per_epoch = message.steps_per_epoch
 
-                print(steps_per_epoch)
+                print(f"  ℹ steps_per_epoch={steps_per_epoch}")
                 
                 print(f"  ✓ Recibido: epoch={message.epoch}, step={step_id}/{steps_per_epoch}, "
-                      f"batches={num_batches_to_process}, stop={message.stop_signal}")
+                      f"batches={num_batches_to_process} (batch_ids=[{start_batch_id}..{batch_ids[-1]}]), stop={message.stop_signal}")
                 
                 # ┌─── HANDSHAKE: Responder a mensaje de sincronización ───┐
                 if message.init_signal and message.epoch == 0:
@@ -359,13 +342,19 @@ class DistributedTrainingWorker:
                     continue
                 # └─────────────────────────────────────────────────┘
                 
+                # Al inicio de cada época (step 0), reiniciamos el iterador del dataloader
+                if step_id == 0:
+                    self.dataloader_iter = iter(self.dataloader)
+                
                 # Actualizar parámetros del modelo
                 self.update_model_params(message.params)
                 print(f"    → Parámetros del modelo actualizados (epoch {message.epoch}, step {step_id})")
                 
-                # Entrenar con los batches asignados
+                # Entrenar con los batches asignados para este paso
                 gradients, loss, accuracy, train_time, buffers = self.train_epoch(
-                    num_batches_to_process, message.learning_rate
+                    start_batch_id=start_batch_id,
+                    num_batches=num_batches_to_process,
+                    learning_rate=message.learning_rate
                 )
                 
                 response = MessageFromWorker(

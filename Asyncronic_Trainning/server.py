@@ -31,12 +31,12 @@ from typing import Dict, List
 import argparse
 
 # Agregar el directorio padre al path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from defineNetwork import Net
 from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig, SHARD_SIZE
 from messageHandling import send_message, receive_message
-from Utils.loadImageNet import (
+from loadImageNet import (
     get_imagenet_stream_dataloader, 
     get_hf_split_size,
     detect_data_source
@@ -83,23 +83,27 @@ class DistributedTrainingServer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net.to(self.device)
         
-        self.optimizer = optim.AdamW(
+        self.optimizer = optim.SGD(
             self.net.parameters(), 
-            lr=learning_rate, 
-            weight_decay=1e-2,
-            betas=(0.9, 0.999), 
-            eps=1e-8
+            lr=learning_rate,
+            momentum=0.9,
+            weight_decay=1e-2
         )
         
         # Dataset size for scheduler
         self.total_dataset_size = get_hf_split_size(split)
-        batches_per_epoch = 1  # 1 weight update step per epoch in this local SGD setup
+        
+        # Step-based synchronization configuration
+        self.steps_per_epoch = TrainingConfig.steps_per_epoch  # Default 10 steps per epoch
+        shard_size = SHARD_SIZE
+        num_batches_per_worker = shard_size // BATCH_SIZE  # Total batches per worker per epoch
+        self.batches_per_step = max(1, num_batches_per_worker // self.steps_per_epoch)  # Batches per sync point
         
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=0.01,
             epochs=epocas,
-            steps_per_epoch=batches_per_epoch,
+            steps_per_epoch=self.steps_per_epoch,
             pct_start=0.3,
             div_factor=10,
             final_div_factor=100
@@ -110,7 +114,7 @@ class DistributedTrainingServer:
         self.worker_connected = {}
         
         # Datos sobre particiones
-        self.shard_sizes = shard_size
+        self.shard_sizes = SHARD_SIZE  
         
         # Historial de checkpoints
         self.historial_intervalo_epochs = []
@@ -183,7 +187,8 @@ class DistributedTrainingServer:
                     params=params,
                     hf_token=self.hf_token,
                     worker_id=worker_id,
-                    num_workers=self.num_workers
+                    num_workers=self.num_workers,
+                    steps_per_epoch=self.steps_per_epoch
                 )
                 
                 # Enviar mensaje de sincronización
@@ -214,15 +219,22 @@ class DistributedTrainingServer:
         
         print(f"  ✓ Todos los workers sincronizados y listos para entrenar")
     
-    def distribute_work(self, epoch, is_last_epoch=False):
+    def distribute_work(self, epoch, step=0, is_last_epoch=False):
         """
-        Distribuye trabajo a todos los workers para una época.
+        Distribuye trabajo a todos los workers para un paso (step) específico dentro de una época.
         
-        Envía a cada worker: epoch, batch_ids, shard_size, pesos globales, learning_rate, etc.
-        Cada worker recibe diferentes batch_ids para trabajar en particiones distintas.
+        Envía a cada worker: epoch, step_id, batch_ids para este paso, pesos globales, learning_rate, etc.
+        Cada step sincroniza un porción del dataset (batches_per_step batches).
+        
+        Args:
+            epoch: Número de época (1-based)
+            step: Número del paso dentro de la época (0-based, 0 to steps_per_epoch-1)
+            is_last_epoch: True si esta es la última época
         """
+        is_last_step = (step == self.steps_per_epoch - 1)
+        
         print(f"\n  {'─'*68}")
-        print(f"  ÉPOCA {epoch}/{self.epocas} — DISTRIBUYENDO TRABAJO A WORKERS")
+        print(f"  ÉPOCA {epoch}/{self.epocas} — PASO {step+1}/{self.steps_per_epoch} — DISTRIBUYENDO TRABAJO")
         print(f"  {'─'*68}")
         
         for worker_id in range(self.num_workers):
@@ -230,12 +242,23 @@ class DistributedTrainingServer:
                 # Calcular número de batches según shard_size
                 shard_size = self.shard_sizes
                 num_batches = shard_size // BATCH_SIZE
+                steps_per_epoch = self.steps_per_epoch
                 
-                # IMPORTANTE: Cada worker recibe diferentes batch_ids
-                # Worker 0: [0, 1, 2, ...], Worker 1: [K, K+1, K+2, ...], etc.
-                batches_per_worker = num_batches // self.num_workers
-                start_batch = worker_id * batches_per_worker
-                end_batch = start_batch + batches_per_worker if worker_id < self.num_workers - 1 else num_batches
+                # Calcular rango de batches para este step
+                # Cada step procesa batches_per_step batches
+                step_start_global = step * self.batches_per_step
+                step_end_global = min((step + 1) * self.batches_per_step, num_batches)  # Don't exceed total batches
+                
+                # Distribuir estos batches entre workers
+                # Worker i procesa: [step_start + i*batch_per_worker_per_step : step_start + (i+1)*batch_per_worker_per_step]
+                batches_per_worker_per_step = (step_end_global - step_start_global) // self.num_workers
+                start_batch = step_start_global + worker_id * batches_per_worker_per_step
+                if worker_id == self.num_workers - 1:
+                    # Last worker gets any remaining batches
+                    end_batch = step_end_global
+                else:
+                    end_batch = start_batch + batches_per_worker_per_step
+                
                 batch_ids = list(range(start_batch, end_batch))
                 
                 # Bug #2 fix: send full state_dict (includes BN running_mean/var buffers)
@@ -244,21 +267,24 @@ class DistributedTrainingServer:
                 message = MessageFromServer(
                     batch_ids=batch_ids,
                     epoch=epoch,
-                    init_signal=True,
-                    stop_signal=is_last_epoch,  # Bug #5 fix: True on final epoch
+                    step_id=step,
+                    steps_per_epoch=steps_per_epoch,
+                    init_signal=(step == 0),  # True only at start of epoch (step 0)
+                    stop_signal=(is_last_epoch and is_last_step),  # True only at final step of final epoch
                     learning_rate=self.learning_rate,
                     shard_size=shard_size,
                     params=params,
-                    hf_token=self.hf_token
+                    hf_token=self.hf_token,
+                    worker_id=worker_id,
+                    num_workers=self.num_workers
                 )
                 
                 # Enviar al worker
                 sock = self.worker_sockets[worker_id]
                 send_message(sock, message)
                 
-                print(f"    ✓ Enviado a worker {worker_id}: epoch={epoch}, "
-                      f"shard_size={shard_size:,}, batches={len(batch_ids)} "
-                      f"[{start_batch}-{end_batch-1}]")
+                print(f"    ✓ Enviado a worker {worker_id}: epoch={epoch},  steps_per_epoch={steps_per_epoch}, "
+                      f"batches={len(batch_ids)} [{start_batch}-{end_batch-1}]")
                 
             except Exception as e:
                 print(f"    ✗ Error enviando a worker {worker_id}: {e}")
@@ -345,12 +371,12 @@ class DistributedTrainingServer:
         print(f"    ℹ Server: Gradient norm total ANTES de clipping: {total_norm:.6f}")
         
         # Aplicar clipping para evitar exploding gradients
-        clipped_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+        clipped_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
         print(f"    ℹ Server: Gradient clipping aplicado (norm={clipped_norm:.6f})")
         
         # Actualizar pesos
         self.optimizer.step()
-        self.scheduler.step()
+        # Note: scheduler.step() is called once per epoch in training_loop, not per step
     
     def apply_worker_buffers(self, messages_list):
         """
@@ -411,44 +437,71 @@ class DistributedTrainingServer:
     
     def training_loop(self):
         """
-        Bucle principal de entrenamiento.
+        Bucle principal de entrenamiento distribuido con sincronización por pasos (steps).
+        
+        Para cada época, realiza múltiples pasos de sincronización (steps_per_epoch).
+        Cada paso: distribuye trabajo → recolecta gradientes → promedia → actualiza pesos.
         """
         print(f"\n{'='*70}")
         print(f"  INICIANDO ENTRENAMIENTO DISTRIBUIDO IMAGENET")
+        print(f"  ({self.steps_per_epoch} pasos de sincronización por época)")
         print(f"{'='*70}\n")
         
         training_start = time.time()
+        epoch_loss_history = []
         
         try:
             for epoch in range(1, self.epocas + 1):
                 epoch_start = time.time()
-                is_last = (epoch == self.epocas)
+                epoch_losses = []
+                epoch_accs = []
+                is_last_epoch = (epoch == self.epocas)
                 
-                # Distribuir trabajo — Bug #5 fix: send stop_signal on final epoch
-                self.distribute_work(epoch, is_last_epoch=is_last)
+                # Bucle de pasos dentro de cada época
+                for step in range(self.steps_per_epoch):
+                    is_last_step = (step == self.steps_per_epoch - 1)
+                    
+                    # Distribuir trabajo para este paso
+                    self.distribute_work(epoch, step=step, is_last_epoch=is_last_epoch)
+                    
+                    # Recolectar resultados de este paso
+                    messages = self.collect_results()
+                    
+                    # Promediar gradientes y calcular pérdidas
+                    avg_grads = self.average_gradients(messages)
+                    avg_loss = sum(msg.loss for msg in messages) / len(messages) if messages else 0.0
+                    avg_acc = sum(msg.accuracy for msg in messages) / len(messages) if messages else 0.0
+                    
+                    epoch_losses.append(avg_loss)
+                    epoch_accs.append(avg_acc)
+                    
+                    # Actualizar pesos con gradientes promediados
+                    self.update_model(avg_grads)
+                    
+                    # Solo sincronizar BN stats al final del paso (no cada paso)
+                    # Esto reduce overhead de comunicación
+                    if is_last_step:
+                        self.apply_worker_buffers(messages)
+                    
+                    # Log del paso
+                    step_time = time.time() - epoch_start
+                    print(f"    ✓ Paso {step+1}/{self.steps_per_epoch} completado "
+                          f"| Loss: {avg_loss:.4f} | Acc: {avg_acc:.2f}%\n")
                 
-                # Recolectar resultados
-                messages = self.collect_results()
-                
-                # Promediar gradientes y calcular pérdida promedio
-                avg_grads = self.average_gradients(messages)
-                avg_loss = sum(msg.loss for msg in messages) / len(messages) if messages else 0.0
-                avg_acc = sum(msg.accuracy for msg in messages) / len(messages) if messages else 0.0
-                
-                # Actualizar pesos con gradientes promediados
-                self.update_model(avg_grads)
-                
-                # Bug #2 fix: sincronizar BN running stats desde los workers
-                self.apply_worker_buffers(messages)
-                
+                # Al final de la época, actualizar scheduler y registrar métricas
                 epoch_time = time.time() - epoch_start
                 total_time = time.time() - training_start
+                avg_epoch_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
+                avg_epoch_acc = sum(epoch_accs) / len(epoch_accs) if epoch_accs else 0.0
+                
+                # Actualizar scheduler una vez por época (epoch-level scheduling)
+                self.scheduler.step()
                 
                 # Registrar métricas en historial
-                self.evaluate_global_model(epoch, total_time, avg_loss)
+                self.evaluate_global_model(epoch, total_time, avg_epoch_loss)
                 
                 print(f"  Epoch {epoch} completada en {epoch_time:.4f}s "
-                      f"(Total: {total_time:.4f}s | Acc: {avg_acc:.2f}%)\n")
+                      f"(Total: {total_time:.4f}s | Acc: {avg_epoch_acc:.2f}%)\n")
             
             print(f"\n{'='*70}")
             print(f"  ENTRENAMIENTO COMPLETADO")

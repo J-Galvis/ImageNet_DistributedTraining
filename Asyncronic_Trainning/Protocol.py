@@ -21,6 +21,8 @@ class MessageFromServer:
     Atributos:
         batch_ids: list - Lista de identificadores de batch a procesar
         epoch: int - Número de época actual
+        step_id: int - Número del paso dentro de la época
+        steps_per_epoch: int - Total de pasos en esta época
         init_signal: bool - True al inicio del entrenamiento
         stop_signal: bool - True para detener el worker
         learning_rate: float - Tasa de aprendizaje
@@ -37,10 +39,13 @@ class MessageFromServer:
     hf_token: str  # Token de HuggingFace para acceso a ImageNet
     worker_id: int = 0
     num_workers: int = 1
+    step_id: int = 0
+    steps_per_epoch: int = 1
     
     def __repr__(self):
-        return (f"MessageFromServer(epoch={self.epoch}, worker_id={self.worker_id}, num_workers={self.num_workers}, "
-                f"batches={len(self.batch_ids)}, shard_size={self.shard_size}, init={self.init_signal}, stop={self.stop_signal})")
+        return (f"MessageFromServer(epoch={self.epoch}, step={self.step_id}/{self.steps_per_epoch}, "
+                f"worker_id={self.worker_id}, num_workers={self.num_workers}, "
+                f"batches={len(self.batch_ids)}, init={self.init_signal}, stop={self.stop_signal})")
 
 
 @dataclass
@@ -51,6 +56,7 @@ class MessageFromWorker:
     Atributos:
         worker_id: int - Identificador del worker (basado en orden de conexión)
         epoch: int - Número de época procesada
+        step_id: int - Número del paso completado
         gradients: Dict - Gradientes acumulados para cada parámetro
         loss: float - Pérdida computada en los batches
         accuracy: float - Precisión en los batches (%)
@@ -62,10 +68,11 @@ class MessageFromWorker:
     loss: float
     accuracy: float
     training_time: float
+    step_id: int
     buffers: Dict = field(default_factory=dict)  # BN running stats (running_mean, running_var)
     
     def __repr__(self):
-        return (f"MessageFromWorker(worker_id={self.worker_id}, epoch={self.epoch}, "
+        return (f"MessageFromWorker(worker_id={self.worker_id}, epoch={self.epoch}, step={self.step_id}, "
                 f"loss={self.loss:.4f}, acc={self.accuracy:.1f}%)")
 
 
@@ -98,9 +105,11 @@ class TrainingConfig:
     intervalo_log: int = 1
     server_host: str = 'localhost'
     server_port: int = 6000
-    socket_timeout: int = 500  # segundos
+    socket_timeout: int = 1500  # segundos
     batch_size: int = 32
     num_classes: int = 1000  # ImageNet tiene 1000 clases
     save_file: str = './Results/imagenet_trained_model.pth'
     imagenet_split: str = 'train'  # 'train' o 'val'
     hf_token: str = ''  # Token de HuggingFace para ImageNet
+    steps_per_epoch: int = 10  # Pasos (sincronizaciones) por época
+    step_id: int = 0  # Paso actual dentro de la época

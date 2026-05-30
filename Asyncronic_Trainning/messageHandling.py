@@ -109,6 +109,7 @@ def send_message(sock, message, compression_threshold=5_000_000, compression_lev
                 'loss': message.loss,
                 'accuracy': message.accuracy,
                 'training_time': message.training_time,
+                'step_id': message.step_id
             })
             # Merge gradients + BN buffers into one payload.
             # Buffer keys are prefixed with '__buf__' to distinguish them.
@@ -132,9 +133,12 @@ def send_message(sock, message, compression_threshold=5_000_000, compression_lev
                 'stop_signal': message.stop_signal,
                 'learning_rate': message.learning_rate,
                 'shard_size': message.shard_size,
+                'params': message.params,
                 'hf_token': message.hf_token,
-                'worker_id': getattr(message, 'worker_id', 0),
-                'num_workers': getattr(message, 'num_workers', 1),
+                'worker_id': message.worker_id,
+                'num_workers': message.num_workers,
+                'steps_per_epoch': message.steps_per_epoch,
+                'step_id': message.step_id
             })
             gradients = message.params if hasattr(message, 'params') else {}
         
@@ -216,6 +220,7 @@ def receive_message(sock, verbose=False):
                 accuracy=metadata['accuracy'],
                 training_time=metadata['training_time'],
                 buffers=bufs,
+                step_id=metadata['step_id']
             )
         elif metadata['type'] == 'WorkerReadyMessage':
             message = WorkerReadyMessage(
@@ -231,11 +236,14 @@ def receive_message(sock, verbose=False):
                 stop_signal=metadata['stop_signal'],
                 learning_rate=metadata['learning_rate'],
                 shard_size=metadata['shard_size'],
-                params=gradients,
+                params=metadata.get('params'),
                 hf_token=metadata['hf_token'],
                 worker_id=metadata.get('worker_id', 0),
-                num_workers=metadata.get('num_workers', 1),
+                num_workers=metadata.get('num_workers', 1), 
+                steps_per_epoch=metadata.get('steps_per_epoch'),
+                step_id=metadata.get('step_id')
             )
+
         
         return message
         
