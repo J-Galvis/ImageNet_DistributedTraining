@@ -1,21 +1,19 @@
 """
 =============================================================================
-  WORKER — ENTRENAMIENTO NEURAL DISTRIBUIDO IMAGENET CON SOCKETS
+  WORKER — ASYNC-SGD DISTRIBUTED TRAINING (STALENESS-AWARE)
 =============================================================================
 
-El worker:
-1. Se conecta al servidor
-2. Para cada época recibe:
-   - batch_ids: lista de identificadores de batches
-   - shard_size: tamaño de la porción del dataset asignada
-   - params: parámetros globales del modelo
-   - learning_rate
-   - init_signal / stop_signal
-3. Carga los batches del shard de ImageNet usando streaming
-4. Entrena acumulando gradientes
-5. Envía gradientes acumulados al servidor
-6. Repite hasta recibir stop_signal
+The worker loop (pullWeights / calcGradient / pushGradient):
+1. Connects to the server and receives initialization (shard info, model params).
+2. In a loop:
+   a. Receives weights + weight-timestamp (step_id = j) from server.
+   b. Computes gradients on its next mini-batches using a persistent iterator.
+   c. Sends gradients + timestamp j back to server.
+   d. Server computes staleness τ = i − j and scales the gradient.
+3. Stops when the server sends stop_signal.
 
+The persistent dataloader iterator auto-resets on StopIteration so the worker
+cycles through its shard continuously without manual epoch tracking.
 =============================================================================
 """
 import os
@@ -205,7 +203,7 @@ class DistributedTrainingWorker:
         Retorna:
             (gradients_dict, avg_loss, avg_accuracy, training_time, buffers_dict)
         """
-        print(f"    Calculando gradientes para paso: {num_batches} batches [batch {start_batch_id}-{start_batch_id + num_batches - 1}]...")
+        print(f"    Calculando gradientes para paso: {num_batches} batches...")
         
         tiempo_inicio = time.time()
         
@@ -251,7 +249,7 @@ class DistributedTrainingWorker:
             else:
                 # En CPU o sin AMP
                 outputs = self.net(inputs)
-                loss = self.criterion(outputs, labels)z
+                loss = self.criterion(outputs, labels)
                 loss.backward()
             # ─────────────────────────────────────────────────────────
             
@@ -305,62 +303,63 @@ class DistributedTrainingWorker:
     
     def training_loop(self):
         """
-        Bucle principal del worker con soporte para pasos (steps) de sincronización.
-        
-        Recibe mensajes del servidor (ahora con step_id), entrena, envía gradientes.
-        Continúa hasta recibir stop_signal.
+        Async worker loop: pullWeights → calcGradient → pushGradient.
+
+        The worker receives weights with a global timestamp (step_id = j),
+        computes gradients, and sends them back with the same timestamp
+        so the server can compute staleness τ = i − j.
+
+        The persistent dataloader iterator auto-resets via StopIteration,
+        so the worker cycles through its shard continuously.
         """
         print(f"\n{'='*70}")
-        print(f"  INICIANDO BUCLE DE ENTRENAMIENTO")
+        print(f"  INICIANDO BUCLE DE ENTRENAMIENTO ASYNC")
         print(f"{'='*70}\n")
         
-        epoch_count = 0
+        round_count = 0
         
         while True:
             try:
-                # Recibir mensaje del servidor
-                print(f"  [Worker] Esperando mensaje del servidor...")
+                # ── pullWeights: receive weights + timestamp from server ──
+                print(f"  [Worker] Esperando pesos del servidor...")
                 message = receive_message(self.socket)
-                
-                epoch_count += 1
-                
-                # Extract batch IDs for this step
-                batch_ids = message.batch_ids
-                start_batch_id = batch_ids[0]
-                num_batches_to_process = len(batch_ids)
-                step_id = message.step_id
-                steps_per_epoch = message.steps_per_epoch
 
-                print(f"  ℹ steps_per_epoch={steps_per_epoch}")
+                # Check stop signal immediately
+                if message.stop_signal:
+                    print(f"\n  ✓ Stop signal recibido. Terminando worker.")
+                    break
                 
-                print(f"  ✓ Recibido: epoch={message.epoch}, step={step_id}/{steps_per_epoch}, "
-                      f"batches={num_batches_to_process} (batch_ids=[{start_batch_id}..{batch_ids[-1]}]), stop={message.stop_signal}")
+                round_count += 1
                 
-                # ┌─── HANDSHAKE: Responder a mensaje de sincronización ───┐
+                # Extract step info
+                num_batches_to_process = len(message.batch_ids)
+                weight_timestamp = message.step_id  # j: the server's global_step when these weights were sent
+                
+                print(f"  ✓ Recibido: epoch={message.epoch}, "
+                      f"weight_timestamp={weight_timestamp}, "
+                      f"batches={num_batches_to_process}, "
+                      f"round={round_count}")
+                
+                # ┌─── HANDSHAKE: skip re-init messages ───┐
                 if message.init_signal and message.epoch == 0:
-                    # Ya manejado en wait_for_initialization
                     continue
-                # └─────────────────────────────────────────────────┘
+                # └────────────────────────────────────────┘
                 
-                # Al inicio de cada época (step 0), reiniciamos el iterador del dataloader
-                if step_id == 0:
-                    self.dataloader_iter = iter(self.dataloader)
-                
-                # Actualizar parámetros del modelo
+                # Update model to the server's latest weights
                 self.update_model_params(message.params)
-                print(f"    → Parámetros del modelo actualizados (epoch {message.epoch}, step {step_id})")
                 
-                # Entrenar con los batches asignados para este paso
+                # ── calcGradient: compute on next mini-batches ───────────
                 gradients, loss, accuracy, train_time, buffers = self.train_epoch(
-                    start_batch_id=start_batch_id,
+                    start_batch_id=0,  # Informational only; persistent iterator handles position
                     num_batches=num_batches_to_process,
                     learning_rate=message.learning_rate
                 )
                 
+                # ── pushGradient: send gradients + timestamp back ────────
                 response = MessageFromWorker(
                     worker_id=self.worker_id,
                     epoch=message.epoch,
-                    step_id=step_id,
+                    step_id=weight_timestamp,  # Echo back j so server computes τ = i − j
                     gradients=gradients,
                     loss=loss,
                     accuracy=accuracy,
@@ -368,15 +367,9 @@ class DistributedTrainingWorker:
                     buffers=buffers,
                 )
                 
-                # Enviar gradientes
-                print(f"    → Enviando gradientes del paso {step_id}...")
+                print(f"    → Enviando gradientes (timestamp={weight_timestamp})...")
                 send_message(self.socket, response)
-                print(f"    ✓ Gradientes enviados\n")
-                
-                # Verificar stop signal
-                if message.stop_signal:
-                    print(f"\n  ✓ Stop signal recibido. Terminando worker.")
-                    break
+                print(f"    ✓ Gradientes enviados (round {round_count})\n")
                 
             except ConnectionError as e:
                 print(f"\n  ✗ Conexión perdida con servidor: {e}")

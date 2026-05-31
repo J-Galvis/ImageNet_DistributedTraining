@@ -1,21 +1,18 @@
 """
 =============================================================================
-  SERVIDOR — ENTRENAMIENTO NEURONAL DISTRIBUIDO IMAGENET CON SOCKETS
+  SERVIDOR — ENTRENAMIENTO DISTRIBUIDO ASYNC-SGD CON STALENESS-AWARE LR
 =============================================================================
 
-El servidor:
-1. Carga el dataset ImageNet en modo streaming (HuggingFace)
-2. Particiona el dataset en K shards (uno por worker)
-3. Abre un socket servidor esperando conexiones de workers
-4. Para cada época:
-   - Envía a cada worker: epoch, batch_ids, shard_size, pesos globales, learning_rate, init/stop signal
-   - Recibe de cada worker: gradientes calculados
-   - Promedia los gradientes
-   - Actualiza los pesos globales
-5. Al final, evaluación en validación
+Implements the n-softsync protocol from:
+  Zhang et al. (2016) — "Staleness-aware Async-SGD for Distributed Deep Learning"
+
+Architecture:
+  * Parameter Server with one thread per worker.
+  * Workers pull weights, compute gradients, and push updates independently.
+  * The server accumulates c = ⌊λ/n⌋ gradients before applying an update.
+  * Each gradient is scaled by 1/max(1, τ) where τ = global_step − worker_step.
 =============================================================================
 """
-
 
 import sys
 import os
@@ -26,6 +23,7 @@ import socket
 import time
 import json
 import numpy as np
+import threading
 from datetime import datetime
 from typing import Dict, List
 import argparse
@@ -37,7 +35,7 @@ from defineNetwork import Net
 from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig, SHARD_SIZE
 from messageHandling import send_message, receive_message
 from loadImageNet import (
-    get_imagenet_stream_dataloader, 
+    get_imagenet_stream_dataloader,
     get_hf_split_size,
     detect_data_source
 )
@@ -47,7 +45,6 @@ from Utils.ModelPersistence import guardar_modelo
 # CONFIGURACIÓN DEL SERVIDOR
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Importar constantes desde TrainingConfig
 NUM_WORKERS = TrainingConfig.num_workers
 LEARNING_RATE = TrainingConfig.learning_rate
 INTERVALO_LOG = TrainingConfig.intervalo_log
@@ -61,15 +58,17 @@ NUM_CLASSES = TrainingConfig.num_classes
 IMAGENET_SPLIT = TrainingConfig.imagenet_split
 HF_TOKEN = TrainingConfig.hf_token
 
-class DistributedTrainingServer:
+
+class AsyncDistributedTrainingServer:
     """
-    Servidor de Entrenamiento Distribuido ImageNet.
-    
-    Maneja conexiones de múltiples workers y coordina el entrenamiento federado
-    con shards de ImageNet.
+    Asynchronous Parameter Server with Staleness-Aware Learning Rate.
+
+    Uses n-softsync: the server updates after collecting c = ⌊λ/n⌋ gradients,
+    each scaled by 1/max(1, τ) where τ is the gradient's staleness.
     """
-    
-    def __init__(self, host, port, num_workers, epocas, learning_rate, hf_token, split='train', shard_size=10000):
+
+    def __init__(self, host, port, num_workers, epocas, learning_rate,
+                 hf_token, split='train', shard_size=10000, splitting_n=None):
         self.host = host
         self.port = port
         self.num_workers = num_workers
@@ -77,28 +76,56 @@ class DistributedTrainingServer:
         self.learning_rate = learning_rate
         self.hf_token = hf_token
         self.split = split
-        
-        # Modelo
+
+        # ── Model ────────────────────────────────────────────────────────
         self.net = Net(num_classes=NUM_CLASSES)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net.to(self.device)
-        
+
         self.optimizer = optim.SGD(
-            self.net.parameters(), 
+            self.net.parameters(),
             lr=learning_rate,
             momentum=0.9,
             weight_decay=1e-2
         )
-        
-        # Dataset size for scheduler
+
+        # Dataset size
         self.total_dataset_size = get_hf_split_size(split)
-        
-        # Step-based synchronization configuration
-        self.steps_per_epoch = TrainingConfig.steps_per_epoch  # Default 10 steps per epoch
+
+        # ── Step / batch arithmetic ──────────────────────────────────────
+        self.steps_per_epoch = TrainingConfig.steps_per_epoch  # Default 10
         shard_size = SHARD_SIZE
-        num_batches_per_worker = shard_size // BATCH_SIZE  # Total batches per worker per epoch
-        self.batches_per_step = max(1, num_batches_per_worker // self.steps_per_epoch)  # Batches per sync point
-        
+        num_batches_per_worker = shard_size // BATCH_SIZE
+        self.batches_per_step = max(1, num_batches_per_worker // self.steps_per_epoch)
+
+        # Total global weight updates to perform across all epochs
+        self.total_updates = self.epocas * self.steps_per_epoch
+
+        # ── n-softsync parameters ────────────────────────────────────────
+        # splitting_n defaults to λ (= Downpour ASGD, c=1)
+        if splitting_n is None:
+            splitting_n = num_workers
+        self.splitting_n = splitting_n
+        self.c = max(1, num_workers // splitting_n)  # update threshold
+
+        # ── Threading primitives ─────────────────────────────────────────
+        self.lock = threading.Lock()
+        self.update_cond = threading.Condition(self.lock)
+
+        # Global weight version counter
+        self.global_step = 0
+
+        # Gradient accumulator (reset after each global update)
+        self.accumulated_grads: Dict[str, np.ndarray] = {}
+        self.accumulated_buffers: List[Dict] = []
+        self.grad_count = 0
+
+        # Per-worker loss/accuracy tracking for logging
+        self.step_losses = []
+        self.step_accuracies = []
+        self.step_staleness = []
+
+        # ── LR scheduler ─────────────────────────────────────────────────
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=0.01,
@@ -108,19 +135,23 @@ class DistributedTrainingServer:
             div_factor=10,
             final_div_factor=100
         )
-        
-        # Conexiones de workers
+
+        # ── Connections ──────────────────────────────────────────────────
         self.worker_sockets: Dict[int, socket.socket] = {}
         self.worker_connected = {}
-        
-        # Datos sobre particiones
-        self.shard_sizes = SHARD_SIZE  
-        
-        # Historial de checkpoints
+        self.shard_sizes = SHARD_SIZE
+
+        # ── History for stats ────────────────────────────────────────────
         self.historial_intervalo_epochs = []
         self.historial_intervalo_times = []
         self.historial_intervalo_loss = []
-    
+
+        # ── Training is done flag ────────────────────────────────────────
+        self.training_done = False
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SOCKET SETUP
+    # ─────────────────────────────────────────────────────────────────────
 
     def setup_socket_server(self):
         """Configura el socket servidor."""
@@ -131,17 +162,21 @@ class DistributedTrainingServer:
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(self.num_workers)
         self.server_socket.settimeout(SOCKET_TIMEOUT)
-        
+
         print(f"\n{'='*70}")
-        print(f"  SERVIDOR DISTRIBUIDO IMAGENET — ESCUCHANDO EN {self.host}:{self.port}")
+        print(f"  SERVIDOR ASYNC-SGD IMAGENET — ESCUCHANDO EN {self.host}:{self.port}")
         print(f"{'='*70}")
+        print(f"  Protocolo: {self.splitting_n}-softsync (c={self.c})")
         print(f"  Esperando {self.num_workers} conexiones de workers...")
-    
+
+    # ─────────────────────────────────────────────────────────────────────
+    # WORKER CONNECTION & HANDSHAKE  (synchronous, before training starts)
+    # ─────────────────────────────────────────────────────────────────────
+
     def wait_for_workers(self):
         """
         Espera a que se conecten todos los workers.
-        Asigna worker_id basado en el orden de conexión.
-        Envía mensaje de sincronización inicial a cada worker con shard_size.
+        Envía mensaje de sincronización inicial y espera handshake.
         """
         # FASE 1: Aceptar todas las conexiones
         for worker_id in range(self.num_workers):
@@ -152,31 +187,30 @@ class DistributedTrainingServer:
                 client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2097152)
                 client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2097152)
-                
+
                 self.worker_sockets[worker_id] = client_socket
                 self.worker_connected[worker_id] = True
-                
+
                 print(f"  ✓ Worker {worker_id} conectado desde {client_address}")
-                
+
             except socket.timeout:
                 print(f"\n  ✗ Timeout esperando worker {worker_id}")
                 raise
             except Exception as e:
                 print(f"\n  ✗ Error aceptando conexión: {e}")
                 raise
-        
+
         # FASE 2: Enviar mensaje de sincronización a todos los workers
         print(f"\n  {'─'*68}")
         print(f"  FASE DE SINCRONIZACIÓN — Enviando señales de inicio a workers")
         print(f"  {'─'*68}")
-        
+
         for worker_id in range(self.num_workers):
             try:
-                # Crear mensaje de sincronización (epoch=0, init_signal=True)
-                # Bug #2 fix: send full state_dict (includes BN running_mean/var buffers)
-                params = {name: tensor.cpu().numpy() for name, tensor in self.net.state_dict().items()}
+                params = {name: tensor.cpu().numpy()
+                          for name, tensor in self.net.state_dict().items()}
                 shard_size = self.shard_sizes
-                
+
                 message = MessageFromServer(
                     batch_ids=[],
                     epoch=0,
@@ -190,87 +224,93 @@ class DistributedTrainingServer:
                     num_workers=self.num_workers,
                     steps_per_epoch=self.steps_per_epoch
                 )
-                
-                # Enviar mensaje de sincronización
+
                 sock = self.worker_sockets[worker_id]
                 send_message(sock, message)
-                
+
                 print(f"    → Sincronización enviada a worker {worker_id} (shard_size={shard_size:,})")
-                
+
             except Exception as e:
                 print(f"    ✗ Error sincronizando worker {worker_id}: {e}")
                 raise
-        
+
         # FASE 3: Esperar confirmación (handshake) de todos los workers
         print(f"\n  {'─'*68}")
         print(f"  FASE DE HANDSHAKE — Esperando confirmación de workers")
         print(f"  {'─'*68}")
-        
+
         for worker_id in range(self.num_workers):
             try:
                 sock = self.worker_sockets[worker_id]
                 ready_msg = receive_message(sock)
-                
+
                 print(f"    ✓ Worker {worker_id} listo (dataset_size={ready_msg.dataset_size:,})")
-                
+
             except Exception as e:
                 print(f"    ✗ Error esperando confirmación de worker {worker_id}: {e}")
                 raise
-        
+
         print(f"  ✓ Todos los workers sincronizados y listos para entrenar")
-    
-    def distribute_work(self, epoch, step=0, is_last_epoch=False):
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SNAPSHOT: thread-safe copy of current model weights
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _snapshot_params(self):
+        """Return a numpy dict of the current model state_dict (under lock)."""
+        return {name: tensor.cpu().numpy()
+                for name, tensor in self.net.state_dict().items()}
+
+    # ─────────────────────────────────────────────────────────────────────
+    # HANDLE WORKER  (one thread per worker)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def handle_worker(self, worker_id):
         """
-        Distribuye trabajo a todos los workers para un paso (step) específico dentro de una época.
-        
-        Envía a cada worker: epoch, step_id, batch_ids para este paso, pesos globales, learning_rate, etc.
-        Cada step sincroniza un porción del dataset (batches_per_step batches).
-        
-        Args:
-            epoch: Número de época (1-based)
-            step: Número del paso dentro de la época (0-based, 0 to steps_per_epoch-1)
-            is_last_epoch: True si esta es la última época
+        Per-worker loop running in its own thread.
+
+        Protocol:
+          1. Send current weights + global_step as timestamp (pullWeights).
+          2. Receive gradient from worker (pushGradient).
+          3. Compute staleness, scale & accumulate gradient.
+          4. If grad_count >= c: apply update, notify all threads.
+             Else: wait for another thread to complete the update.
+          5. Repeat from 1 until training is done.
         """
-        is_last_step = (step == self.steps_per_epoch - 1)
-        
-        print(f"\n  {'─'*68}")
-        print(f"  ÉPOCA {epoch}/{self.epocas} — PASO {step+1}/{self.steps_per_epoch} — DISTRIBUYENDO TRABAJO")
-        print(f"  {'─'*68}")
-        
-        for worker_id in range(self.num_workers):
+        sock = self.worker_sockets[worker_id]
+        shard_size = self.shard_sizes
+
+        while True:
             try:
-                # Calcular número de batches según shard_size
-                shard_size = self.shard_sizes
+                # ────── CHECK COMPLETION (under lock) ────────────────────
+                with self.lock:
+                    if self.training_done:
+                        self._send_stop(sock, worker_id, shard_size)
+                        break
+
+                    # Snapshot weights and current global step
+                    current_step = self.global_step
+                    params = self._snapshot_params()
+
+                # ────── SEND WEIGHTS (outside lock for parallelism) ──────
+                # Compute which batches this worker should process
+                # Each "round" a worker processes batches_per_step batches
+                # from its persistent iterator — batch_ids are informational.
+                step_in_epoch = current_step % self.steps_per_epoch
+                epoch_num = (current_step // self.steps_per_epoch) + 1
+
                 num_batches = shard_size // BATCH_SIZE
-                steps_per_epoch = self.steps_per_epoch
-                
-                # Calcular rango de batches para este step
-                # Cada step procesa batches_per_step batches
-                step_start_global = step * self.batches_per_step
-                step_end_global = min((step + 1) * self.batches_per_step, num_batches)  # Don't exceed total batches
-                
-                # Distribuir estos batches entre workers
-                # Worker i procesa: [step_start + i*batch_per_worker_per_step : step_start + (i+1)*batch_per_worker_per_step]
-                batches_per_worker_per_step = (step_end_global - step_start_global) // self.num_workers
-                start_batch = step_start_global + worker_id * batches_per_worker_per_step
-                if worker_id == self.num_workers - 1:
-                    # Last worker gets any remaining batches
-                    end_batch = step_end_global
-                else:
-                    end_batch = start_batch + batches_per_worker_per_step
-                
-                batch_ids = list(range(start_batch, end_batch))
-                
-                # Bug #2 fix: send full state_dict (includes BN running_mean/var buffers)
-                params = {name: tensor.cpu().numpy() for name, tensor in self.net.state_dict().items()}
-                
+                step_start = step_in_epoch * self.batches_per_step
+                step_end = min((step_in_epoch + 1) * self.batches_per_step, num_batches)
+                batch_ids = list(range(step_start, step_end))
+
                 message = MessageFromServer(
                     batch_ids=batch_ids,
-                    epoch=epoch,
-                    step_id=step,
-                    steps_per_epoch=steps_per_epoch,
-                    init_signal=(step == 0),  # True only at start of epoch (step 0)
-                    stop_signal=(is_last_epoch and is_last_step),  # True only at final step of final epoch
+                    epoch=epoch_num,
+                    step_id=current_step,           # ← weight timestamp j
+                    steps_per_epoch=self.steps_per_epoch,
+                    init_signal=False,
+                    stop_signal=False,
                     learning_rate=self.learning_rate,
                     shard_size=shard_size,
                     params=params,
@@ -278,248 +318,266 @@ class DistributedTrainingServer:
                     worker_id=worker_id,
                     num_workers=self.num_workers
                 )
-                
-                # Enviar al worker
-                sock = self.worker_sockets[worker_id]
+
                 send_message(sock, message)
-                
-                print(f"    ✓ Enviado a worker {worker_id}: epoch={epoch},  steps_per_epoch={steps_per_epoch}, "
-                      f"batches={len(batch_ids)} [{start_batch}-{end_batch-1}]")
-                
+
+                # ────── RECEIVE GRADIENT ─────────────────────────────────
+                response = receive_message(sock)
+
+                # ────── ACCUMULATE UNDER LOCK ────────────────────────────
+                with self.update_cond:
+                    if self.training_done:
+                        # Another thread finished training while we were computing
+                        self._send_stop(sock, worker_id, shard_size)
+                        break
+
+                    # Compute staleness τ = i − j
+                    worker_timestamp = response.step_id  # j: step when worker pulled weights
+                    staleness = max(1, self.global_step - worker_timestamp)
+                    lr_scale = 1.0 / staleness
+
+                    # Scale and accumulate gradients
+                    for name, grad in response.gradients.items():
+                        scaled_grad = grad * lr_scale
+                        if name in self.accumulated_grads:
+                            self.accumulated_grads[name] += scaled_grad
+                        else:
+                            self.accumulated_grads[name] = scaled_grad.copy()
+
+                    self.grad_count += 1
+
+                    # Accumulate BN buffers
+                    if getattr(response, 'buffers', None):
+                        self.accumulated_buffers.append(response.buffers)
+
+                    # Track metrics
+                    self.step_losses.append(response.loss)
+                    self.step_accuracies.append(response.accuracy)
+                    self.step_staleness.append(staleness)
+
+                    print(f"    ← Worker {worker_id}: loss={response.loss:.4f}, "
+                          f"acc={response.accuracy:.2f}%, τ={staleness}, "
+                          f"lr_scale={lr_scale:.4f}, "
+                          f"grad_count={self.grad_count}/{self.c}")
+
+                    # ── Check threshold ──────────────────────────────────
+                    if self.grad_count >= self.c:
+                        # Average the accumulated gradients
+                        avg_grads = {name: g / self.grad_count
+                                     for name, g in self.accumulated_grads.items()}
+
+                        # Apply the update
+                        self._apply_gradients(avg_grads)
+
+                        # Apply BN buffers
+                        if self.accumulated_buffers:
+                            self._apply_buffers(self.accumulated_buffers)
+
+                        # Step scheduler
+                        self.scheduler.step()
+
+                        # Log update
+                        avg_loss = np.mean(self.step_losses) if self.step_losses else 0.0
+                        avg_acc = np.mean(self.step_accuracies) if self.step_accuracies else 0.0
+                        avg_stale = np.mean(self.step_staleness) if self.step_staleness else 0.0
+                        current_epoch = (self.global_step // self.steps_per_epoch) + 1
+                        step_in_ep = (self.global_step % self.steps_per_epoch) + 1
+
+                        print(f"\n  {'─'*68}")
+                        print(f"  GLOBAL UPDATE #{self.global_step + 1}/{self.total_updates} "
+                              f"(Epoch {current_epoch}, Step {step_in_ep}/{self.steps_per_epoch})")
+                        print(f"    Avg Loss: {avg_loss:.4f} | Avg Acc: {avg_acc:.2f}% "
+                              f"| Avg Staleness: {avg_stale:.1f}")
+                        print(f"  {'─'*68}\n")
+
+                        # Evaluate / log at epoch boundaries
+                        total_time = time.time() - self.training_start
+                        self.evaluate_global_model(current_epoch, total_time, avg_loss)
+
+                        # Increment global step
+                        self.global_step += 1
+
+                        # Reset accumulators
+                        self.accumulated_grads = {}
+                        self.accumulated_buffers = []
+                        self.grad_count = 0
+                        self.step_losses = []
+                        self.step_accuracies = []
+                        self.step_staleness = []
+
+                        # Check if training is complete
+                        if self.global_step >= self.total_updates:
+                            self.training_done = True
+
+                        # Wake up all threads waiting for this update
+                        self.update_cond.notify_all()
+                    else:
+                        # Wait until another thread triggers the update
+                        # Use a timeout to re-check training_done flag
+                        self.update_cond.wait(timeout=60.0)
+
+            except (ConnectionError, BrokenPipeError, OSError) as e:
+                print(f"\n  ✗ Worker {worker_id} disconnected: {e}")
+                break
             except Exception as e:
-                print(f"    ✗ Error enviando a worker {worker_id}: {e}")
-                raise
-    
-    def collect_results(self):
-        """
-        Recolecta resultados de todos los workers para la época actual.
-        
-        Recibe gradientes y métricas de cada worker.
-        """
-        print(f"\n  {'─'*68}")
-        print(f"  RECOLECTANDO RESULTADOS DE WORKERS")
-        print(f"  {'─'*68}")
-        
-        all_messages = []
-        
-        for worker_id in range(self.num_workers):
-            try:
-                sock = self.worker_sockets[worker_id]
-                message = receive_message(sock)
-                
-                all_messages.append(message)
-                print(f"    ✓ Worker {worker_id}: {message}")
-                
-            except Exception as e:
-                print(f"    ✗ Error recibiendo de worker {worker_id}: {e}")
-                raise
-        
-        return all_messages
-    
-    def average_gradients(self, messages_list):
-        """
-        Promedia los gradientes de todos los workers.
-        
-        IMPORTANTE: Los gradientes ya están normalizados por batch_count en el worker.
-        Solo necesitamos promediarlos aquí.
-        
-        Retorna:
-            Dict con gradientes promediados para cada parámetro
-        """
-        num_workers = len(messages_list)
-        
-        # Inicializar diccionario de gradientes promediados
-        avg_grads = {}
-        
-        # Iterar sobre todas las claves de parámetros del primer worker
-        if num_workers > 0:
-            for param_name in messages_list[0].gradients.keys():
-                # Promediar este parámetro de todos los workers
-                grads_list = [msg.gradients[param_name] for msg in messages_list]
-                avg_grads[param_name] = sum(grads_list) / num_workers
-        
-        # Log de depuración: verificar magnitud de gradientes promediados
-        if avg_grads:
-            grad_norms = [np.linalg.norm(g.flatten()) for g in avg_grads.values() if g.size > 0]
-            avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
-            print(f"    ℹ Server: Gradient norm promedio después de averaging: {avg_grad_norm:.6f} (across {num_workers} workers)")
-        
-        return avg_grads
-    
-    def update_model(self, avg_grads):
-        """
-        Actualiza los pesos del modelo usando los gradientes promediados.
-        
-        Los gradientes llegan ya:
-        - Normalizados por batch_count desde el worker
-        - Promediados entre workers
-        """
+                print(f"\n  ✗ Error in worker {worker_id} handler: {e}")
+                import traceback
+                traceback.print_exc()
+                break
+
+    def _send_stop(self, sock, worker_id, shard_size):
+        """Send a stop signal to a worker."""
+        try:
+            params = self._snapshot_params()
+            message = MessageFromServer(
+                batch_ids=[],
+                epoch=self.epocas,
+                step_id=self.global_step,
+                steps_per_epoch=self.steps_per_epoch,
+                init_signal=False,
+                stop_signal=True,
+                learning_rate=self.learning_rate,
+                shard_size=shard_size,
+                params=params,
+                hf_token=self.hf_token,
+                worker_id=worker_id,
+                num_workers=self.num_workers
+            )
+            send_message(sock, message)
+            print(f"    → Stop signal enviado a worker {worker_id}")
+        except Exception as e:
+            print(f"    ✗ Error enviando stop a worker {worker_id}: {e}")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # GRADIENT APPLICATION
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _apply_gradients(self, avg_grads):
+        """Apply averaged gradients to the model (must be called under lock)."""
         self.optimizer.zero_grad()
-        
-        # Asignar gradientes a los parámetros
+
         for name, param in self.net.named_parameters():
             if name in avg_grads:
-                param.grad = torch.tensor(avg_grads[name], dtype=param.dtype, device=param.device)
-        
-        # Log de depuración: verificar norma total de gradientes antes de clipping
+                param.grad = torch.tensor(
+                    avg_grads[name], dtype=param.dtype, device=param.device
+                )
+
+        # Log gradient norm before clipping
         total_norm = 0.0
         for p in self.net.parameters():
             if p.grad is not None:
                 param_norm = p.grad.data.norm(2)
                 total_norm += param_norm.item() ** 2
         total_norm = total_norm ** 0.5
-        print(f"    ℹ Server: Gradient norm total ANTES de clipping: {total_norm:.6f}")
-        
-        # Aplicar clipping para evitar exploding gradients
+        print(f"    ℹ Gradient norm BEFORE clipping: {total_norm:.6f}")
+
+        # Clip gradients
         clipped_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
-        print(f"    ℹ Server: Gradient clipping aplicado (norm={clipped_norm:.6f})")
-        
-        # Actualizar pesos
+        print(f"    ℹ Gradient clipping applied (norm={clipped_norm:.6f})")
+
+        # Update weights
         self.optimizer.step()
-        # Note: scheduler.step() is called once per epoch in training_loop, not per step
-    
-    def apply_worker_buffers(self, messages_list):
-        """
-        Bug #2 fix: average BN running stats from all workers and apply to the
-        server model so that saved checkpoints have correct normalization for eval.
-        
-        running_mean / running_var  → averaged across workers.
-        num_batches_tracked          → taken from worker 0 (it's a counter, not a stat).
-        """
-        all_bufs = [msg.buffers for msg in messages_list if getattr(msg, 'buffers', None)]
-        if not all_bufs or not all_bufs[0]:
-            return  # workers didn't send buffers (old protocol) — skip silently
-        
+
+    def _apply_buffers(self, buffer_list):
+        """Average BN running stats from accumulated buffers and apply."""
+        if not buffer_list or not buffer_list[0]:
+            return
+
         current_state = self.net.state_dict()
-        new_state = dict(current_state)  # shallow copy; we'll replace BN entries
-        
-        for buf_name in all_bufs[0].keys():
-            buf_arrays = [b[buf_name] for b in all_bufs if buf_name in b]
+        new_state = dict(current_state)
+
+        for buf_name in buffer_list[0].keys():
+            buf_arrays = [b[buf_name] for b in buffer_list if buf_name in b]
             if not buf_arrays:
                 continue
-            
+
             target = current_state.get(buf_name)
             if target is None:
                 continue
-            
+
             if 'num_batches_tracked' in buf_name:
-                # Counter — just take the value from the first worker
                 merged = torch.tensor(buf_arrays[0], dtype=target.dtype, device=target.device)
             else:
-                # running_mean / running_var — average across workers
                 avg = sum(buf_arrays) / len(buf_arrays)
                 merged = torch.tensor(avg, dtype=target.dtype, device=target.device)
-            
+
             new_state[buf_name] = merged
-        
+
         self.net.load_state_dict(new_state)
-        print(f"    ℹ Server: BN running stats sincronizadas desde {len(all_bufs)} workers")
-    
+        print(f"    ℹ BN running stats synced from {len(buffer_list)} worker contributions")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # EVALUATION / LOGGING
+    # ─────────────────────────────────────────────────────────────────────
+
     def evaluate_global_model(self, epoch, tiempo_actual, avg_loss):
-        """
-        Evalúa el modelo global y guarda métricas en historial.
-        
-        Parámetros:
-            epoch: int, número de época actual
-            tiempo_actual: float, tiempo transcurrido desde el inicio del entrenamiento
-            avg_loss: float, pérdida promedio de la época
-        """
+        """Log epoch-level metrics."""
         if epoch % INTERVALO_LOG == 0 or epoch == 1:
-            self.historial_intervalo_epochs.append(epoch)
-            self.historial_intervalo_times.append(round(tiempo_actual, 6))
-            self.historial_intervalo_loss.append(round(avg_loss, 6))
-            
-            print(f"\n  {'─'*68}")
-            print(f"  EVALUACIÓN GLOBAL — ÉPOCA {epoch}/{self.epocas}")
-            print(f"  {'─'*68}")
-            print(f"    ✓ GLOBAL → Loss: {avg_loss:.4f}")
-            print(f"    ⏱ Tiempo acumulado: {tiempo_actual:.2f}s")
-    
+            # Only log once per epoch (avoid duplicates from multiple updates in same epoch)
+            if epoch not in self.historial_intervalo_epochs:
+                self.historial_intervalo_epochs.append(epoch)
+                self.historial_intervalo_times.append(round(tiempo_actual, 6))
+                self.historial_intervalo_loss.append(round(avg_loss, 6))
+
+                print(f"\n  {'─'*68}")
+                print(f"  EVALUACIÓN GLOBAL — ÉPOCA {epoch}/{self.epocas}")
+                print(f"  {'─'*68}")
+                print(f"    ✓ GLOBAL → Loss: {avg_loss:.4f}")
+                print(f"    ⏱ Tiempo acumulado: {tiempo_actual:.2f}s")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # MAIN TRAINING LOOP  (spawns threads)
+    # ─────────────────────────────────────────────────────────────────────
+
     def training_loop(self):
         """
-        Bucle principal de entrenamiento distribuido con sincronización por pasos (steps).
-        
-        Para cada época, realiza múltiples pasos de sincronización (steps_per_epoch).
-        Cada paso: distribuye trabajo → recolecta gradientes → promedia → actualiza pesos.
+        Main async training loop.
+
+        Spawns one thread per worker and waits for all threads to complete.
         """
         print(f"\n{'='*70}")
-        print(f"  INICIANDO ENTRENAMIENTO DISTRIBUIDO IMAGENET")
-        print(f"  ({self.steps_per_epoch} pasos de sincronización por época)")
+        print(f"  INICIANDO ENTRENAMIENTO ASYNC-SGD ({self.splitting_n}-softsync)")
+        print(f"  Workers: {self.num_workers} | c={self.c} | "
+              f"Total updates: {self.total_updates}")
         print(f"{'='*70}\n")
-        
-        training_start = time.time()
-        epoch_loss_history = []
-        
+
+        self.training_start = time.time()
+
         try:
-            for epoch in range(1, self.epocas + 1):
-                epoch_start = time.time()
-                epoch_losses = []
-                epoch_accs = []
-                is_last_epoch = (epoch == self.epocas)
-                
-                # Bucle de pasos dentro de cada época
-                for step in range(self.steps_per_epoch):
-                    is_last_step = (step == self.steps_per_epoch - 1)
-                    
-                    # Distribuir trabajo para este paso
-                    self.distribute_work(epoch, step=step, is_last_epoch=is_last_epoch)
-                    
-                    # Recolectar resultados de este paso
-                    messages = self.collect_results()
-                    
-                    # Promediar gradientes y calcular pérdidas
-                    avg_grads = self.average_gradients(messages)
-                    avg_loss = sum(msg.loss for msg in messages) / len(messages) if messages else 0.0
-                    avg_acc = sum(msg.accuracy for msg in messages) / len(messages) if messages else 0.0
-                    
-                    epoch_losses.append(avg_loss)
-                    epoch_accs.append(avg_acc)
-                    
-                    # Actualizar pesos con gradientes promediados
-                    self.update_model(avg_grads)
-                    
-                    # Solo sincronizar BN stats al final del paso (no cada paso)
-                    # Esto reduce overhead de comunicación
-                    if is_last_step:
-                        self.apply_worker_buffers(messages)
-                    
-                    # Log del paso
-                    step_time = time.time() - epoch_start
-                    print(f"    ✓ Paso {step+1}/{self.steps_per_epoch} completado "
-                          f"| Loss: {avg_loss:.4f} | Acc: {avg_acc:.2f}%\n")
-                
-                # Al final de la época, actualizar scheduler y registrar métricas
-                epoch_time = time.time() - epoch_start
-                total_time = time.time() - training_start
-                avg_epoch_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
-                avg_epoch_acc = sum(epoch_accs) / len(epoch_accs) if epoch_accs else 0.0
-                
-                # Actualizar scheduler una vez por época (epoch-level scheduling)
-                self.scheduler.step()
-                
-                # Registrar métricas en historial
-                self.evaluate_global_model(epoch, total_time, avg_epoch_loss)
-                
-                print(f"  Epoch {epoch} completada en {epoch_time:.4f}s "
-                      f"(Total: {total_time:.4f}s | Acc: {avg_epoch_acc:.2f}%)\n")
-            
+            # Spawn one handler thread per worker
+            threads = []
+            for worker_id in range(self.num_workers):
+                t = threading.Thread(
+                    target=self.handle_worker,
+                    args=(worker_id,),
+                    name=f"worker-{worker_id}",
+                    daemon=True
+                )
+                t.start()
+                threads.append(t)
+                print(f"  ✓ Thread para worker {worker_id} iniciado")
+
+            # Wait for all threads to finish
+            for t in threads:
+                t.join()
+
             print(f"\n{'='*70}")
             print(f"  ENTRENAMIENTO COMPLETADO")
             print(f"{'='*70}\n")
-            
-            # Calcular tiempo total de entrenamiento
-            tiempo_total = time.time() - training_start
+
+            # Compute total training time
+            tiempo_total = time.time() - self.training_start
 
             nombre_modelo = input("\n  Ingrese un nombre para guardar el modelo: ").strip()
-            
-            # Guardar modelo PyTorch
+
+            # Save PyTorch model
             model_path = f"models/{nombre_modelo}_imagenet.pt"
             os.makedirs("models", exist_ok=True)
             torch.save(self.net.state_dict(), model_path)
-            
-            # Guardar modelo con métricas completas
+
+            # Save model with complete metrics
             guardar_modelo(
-                None, None, None, None,  # PyTorch model, not NumPy weights
+                None, None, None, None,
                 nombre_modelo=nombre_modelo,
                 precision_test=0.0,
                 epocas=self.epocas,
@@ -527,10 +585,12 @@ class DistributedTrainingServer:
                 training_time=tiempo_total,
                 info_extra={
                     'num_workers': self.num_workers,
-                    'architecture': 'ImageNet ResNet - Distributed with Sockets',
+                    'architecture': 'ImageNet ResNet - Async-SGD with Sockets',
+                    'protocol': f'{self.splitting_n}-softsync (c={self.c})',
                     'server_host': self.host,
                     'server_port': self.port,
                     'tiempo_total_segundos': tiempo_total,
+                    'total_global_updates': self.global_step,
                     'historial_intervalo_epochs': self.historial_intervalo_epochs,
                     'historial_intervalo_times': self.historial_intervalo_times,
                     'historial_intervalo_loss': self.historial_intervalo_loss,
@@ -539,24 +599,28 @@ class DistributedTrainingServer:
                     'num_classes': NUM_CLASSES,
                 }
             )
-        
+
         except Exception as e:
             print(f"\n✗ Error durante entrenamiento: {e}")
+            import traceback
+            traceback.print_exc()
             raise
         finally:
-            # Cerrar conexiones
+            # Close connections
             for worker_id, sock in self.worker_sockets.items():
                 try:
                     sock.close()
                 except:
                     pass
             self.server_socket.close()
-    
 
-def start_server(host, port, num_workers, epocas, learning_rate, hf_token, split, shard_size):
-    """Inicia el servidor de entrenamiento distribuido"""
-    server = DistributedTrainingServer(
-        host, port, num_workers, epocas, learning_rate, hf_token, split, shard_size
+
+def start_server(host, port, num_workers, epocas, learning_rate,
+                 hf_token, split, shard_size, splitting_n):
+    """Inicia el servidor de entrenamiento distribuido async."""
+    server = AsyncDistributedTrainingServer(
+        host, port, num_workers, epocas, learning_rate,
+        hf_token, split, shard_size, splitting_n
     )
     server.setup_socket_server()
     server.wait_for_workers()
@@ -565,42 +629,37 @@ def start_server(host, port, num_workers, epocas, learning_rate, hf_token, split
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description="Servidor para entrenamiento distribuido de ImageNet."
+        description="Servidor para entrenamiento distribuido Async-SGD de ImageNet."
     )
 
     parser.add_argument(
-        "--host",
-        "-H",
+        "--host", "-H",
         default=SERVER_HOST,
         help=f"Host en el que el servidor escuchará (por defecto: {SERVER_HOST})",
     )
     parser.add_argument(
-        "--port",
-        "-p",
+        "--port", "-p",
         type=int,
         default=SERVER_PORT,
         help=f"Puerto en el que el servidor escuchará (por defecto: {SERVER_PORT})",
     )
     parser.add_argument(
-        "--workers",
-        "-w",
+        "--workers", "-w",
         type=int,
         default=NUM_WORKERS,
-        help=f"Número de workers (por defecto: {NUM_WORKERS})",
+        help=f"Número de workers λ (por defecto: {NUM_WORKERS})",
     )
     parser.add_argument(
-        "--epocas",
-        "-e",
+        "--epocas", "-e",
         type=int,
         default=NUM_EPOCHS,
         help=f"Cantidad de épocas para entrenar (por defecto: {NUM_EPOCHS})",
     )
     parser.add_argument(
-        "--lr",
-        "--learning-rate",
+        "--lr", "--learning-rate",
         type=float,
         default=LEARNING_RATE,
-        help=f"Tasa de aprendizaje (por defecto: {LEARNING_RATE})",
+        help=f"Tasa de aprendizaje base α₀ (por defecto: {LEARNING_RATE})",
     )
     parser.add_argument(
         "--hf-token",
@@ -621,6 +680,15 @@ if __name__ == '__main__':
         default=10000,
         help="Tamaño de shard de datos por worker (por defecto: 10000)",
     )
+    parser.add_argument(
+        "--splitting-n",
+        type=int,
+        default=None,
+        help="Parámetro n para n-softsync. "
+             "c = ⌊λ/n⌋ gradientes se acumulan antes de actualizar. "
+             "Default: n=λ (Downpour ASGD, c=1). "
+             "n=1 da SGD síncrono (c=λ).",
+    )
 
     args = parser.parse_args()
 
@@ -633,4 +701,5 @@ if __name__ == '__main__':
         args.hf_token,
         args.split,
         args.shard_size,
+        args.splitting_n,
     )
