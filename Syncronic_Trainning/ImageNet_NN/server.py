@@ -69,23 +69,30 @@ class DistributedTrainingServer:
     con shards de ImageNet.
     """
     
-    def __init__(self, host, port, num_workers, epocas, learning_rate, hf_token, split='train', shard_size=10000):
+    def __init__(self, host, port, num_workers, epocas, learning_rate, hf_token, split='train', shard_size=10000, pretrained=False, freeze_backbone=False):
         self.host = host
         self.port = port
         self.num_workers = num_workers
         self.epocas = epocas
-        self.learning_rate = learning_rate
         self.hf_token = hf_token
         self.split = split
         
+        # If fine-tuning a pretrained model (no freeze) and learning rate is the default 0.01,
+        # adjust default to 0.0001 (1e-4) to avoid disrupting pretrained weights.
+        if pretrained and not freeze_backbone and learning_rate == 0.01:
+            print("  ℹ Fine-tuning pretrained model: adjusting learning rate to 0.0001 (1e-4)")
+            self.learning_rate = 0.0001
+        else:
+            self.learning_rate = learning_rate
+            
         # Modelo
-        self.net = Net(num_classes=NUM_CLASSES)
+        self.net = Net(num_classes=NUM_CLASSES, pretrained=pretrained, freeze_backbone=freeze_backbone)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net.to(self.device)
         
         self.optimizer = optim.SGD(
-            self.net.parameters(), 
-            lr=learning_rate,
+            filter(lambda p: p.requires_grad, self.net.parameters()), 
+            lr=self.learning_rate,
             momentum=0.9,
             weight_decay=1e-2
         )
@@ -477,11 +484,11 @@ class DistributedTrainingServer:
                     
                     # Actualizar pesos con gradientes promediados
                     self.update_model(avg_grads)
+                    self.scheduler.step()
                     
-                    # Solo sincronizar BN stats al final del paso (no cada paso)
-                    # Esto reduce overhead de comunicación
-                    if is_last_step:
-                        self.apply_worker_buffers(messages)
+                    # Sincronizar BN stats en cada paso para que el servidor distribuya
+                    # los buffers de BatchNorm actualizados a todos los workers.
+                    self.apply_worker_buffers(messages)
                     
                     # Log del paso
                     step_time = time.time() - epoch_start
@@ -493,9 +500,6 @@ class DistributedTrainingServer:
                 total_time = time.time() - training_start
                 avg_epoch_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
                 avg_epoch_acc = sum(epoch_accs) / len(epoch_accs) if epoch_accs else 0.0
-                
-                # Actualizar scheduler una vez por época (epoch-level scheduling)
-                self.scheduler.step()
                 
                 # Registrar métricas en historial
                 self.evaluate_global_model(epoch, total_time, avg_epoch_loss)
@@ -553,10 +557,11 @@ class DistributedTrainingServer:
             self.server_socket.close()
     
 
-def start_server(host, port, num_workers, epocas, learning_rate, hf_token, split, shard_size):
+def start_server(host, port, num_workers, epocas, learning_rate, hf_token, split, shard_size, pretrained, freeze_backbone):
     """Inicia el servidor de entrenamiento distribuido"""
     server = DistributedTrainingServer(
-        host, port, num_workers, epocas, learning_rate, hf_token, split, shard_size
+        host, port, num_workers, epocas, learning_rate, hf_token, split, shard_size,
+        pretrained=pretrained, freeze_backbone=freeze_backbone
     )
     server.setup_socket_server()
     server.wait_for_workers()
@@ -621,6 +626,16 @@ if __name__ == '__main__':
         default=10000,
         help="Tamaño de shard de datos por worker (por defecto: 10000)",
     )
+    parser.add_argument(
+        "--pretrained",
+        action="store_true",
+        help="Usar un modelo ResNet-18 preentrenado",
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="Congelar los pesos del feature extractor (backbone) en el modelo preentrenado",
+    )
 
     args = parser.parse_args()
 
@@ -633,4 +648,6 @@ if __name__ == '__main__':
         args.hf_token,
         args.split,
         args.shard_size,
+        args.pretrained,
+        args.freeze_backbone,
     )

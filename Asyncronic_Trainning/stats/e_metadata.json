@@ -1,0 +1,34 @@
+{
+  "nombre_modelo": "e",
+  "fecha_guardado": "2026-05-30 20:59:51",
+  "precision_test": 0.0,
+  "epocas": 10,
+  "learning_rate": 0.01,
+  "training_time_seconds": 1798.082442522049,
+  "arquitectura": {
+    "entrada": null,
+    "oculta": null,
+    "salida": null
+  },
+  "info_extra": {
+    "num_workers": 1,
+    "architecture": "ImageNet ResNet - Async-SGD with Sockets",
+    "protocol": "1-softsync (c=1)",
+    "server_host": "localhost",
+    "server_port": 6000,
+    "tiempo_total_segundos": 1798.082442522049,
+    "total_global_updates": 1,
+    "historial_intervalo_epochs": [
+      1
+    ],
+    "historial_intervalo_times": [
+      948.487756
+    ],
+    "historial_intervalo_loss": [
+      7.444078
+    ],
+    "model_path": "models/e_imagenet.pt",
+    "dataset_split": "train",
+    "num_classes": 1000
+  }
+}

@@ -11,41 +11,54 @@ class Net(nn.Module):
     entrenamiento distribuido. Soporta 1000 clases de ImageNet.
     """
     
-    def __init__(self, num_classes=1000):
+    def __init__(self, num_classes=1000, pretrained=False, freeze_backbone=False):
         super(Net, self).__init__()
+        self.pretrained = pretrained
+        self.freeze_backbone = freeze_backbone
         
-        # ─────────────────────────────────────────────────────────
-        # BLOQUE INICIAL!
-        # ─────────────────────────────────────────────────────────
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        
-        # ─────────────────────────────────────────────────────────
-        # BLOQUES RESIDUALES (Simplified ResNet)
-        # ─────────────────────────────────────────────────────────
-        
-        # Layer 1: 64 canales, 56x56 spatial
-        self.layer1 = self._make_residual_block(64, 64, num_blocks=3, stride=1)
-        
-        # Layer 2: 128 canales, 28x28 spatial
-        self.layer2 = self._make_residual_block(64, 128, num_blocks=4, stride=2)
-        
-        # Layer 3: 256 canales, 14x14 spatial
-        self.layer3 = self._make_residual_block(128, 256, num_blocks=6, stride=2)
-        
-        # Layer 4: 512 canales, 7x7 spatial
-        self.layer4 = self._make_residual_block(256, 512, num_blocks=3, stride=2)
-        
-        # ─────────────────────────────────────────────────────────
-        # CLASIFICADOR
-        # ─────────────────────────────────────────────────────────
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512, num_classes)
-        
-        # Inicialización de pesos
-        self._initialize_weights()
+        if pretrained:
+            from torchvision.models import resnet18, ResNet18_Weights
+            self.backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
+            in_features = self.backbone.fc.in_features
+            self.backbone.fc = nn.Linear(in_features, num_classes)
+            
+            if freeze_backbone:
+                for name, param in self.backbone.named_parameters():
+                    if "fc" not in name:
+                        param.requires_grad = False
+        else:
+            # ─────────────────────────────────────────────────────────
+            # BLOQUE INICIAL!
+            # ─────────────────────────────────────────────────────────
+            self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            self.bn1 = nn.BatchNorm2d(64)
+            self.relu = nn.ReLU(inplace=True)
+            self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+            
+            # ─────────────────────────────────────────────────────────
+            # BLOQUES RESIDUALES (Simplified ResNet)
+            # ─────────────────────────────────────────────────────────
+            
+            # Layer 1: 64 canales, 56x56 spatial
+            self.layer1 = self._make_residual_block(64, 64, num_blocks=3, stride=1)
+            
+            # Layer 2: 128 canales, 28x28 spatial
+            self.layer2 = self._make_residual_block(64, 128, num_blocks=4, stride=2)
+            
+            # Layer 3: 256 canales, 14x14 spatial
+            self.layer3 = self._make_residual_block(128, 256, num_blocks=6, stride=2)
+            
+            # Layer 4: 512 canales, 7x7 spatial
+            self.layer4 = self._make_residual_block(256, 512, num_blocks=3, stride=2)
+            
+            # ─────────────────────────────────────────────────────────
+            # CLASIFICADOR
+            # ─────────────────────────────────────────────────────────
+            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+            self.fc = nn.Linear(512, num_classes)
+            
+            # Inicialización de pesos
+            self._initialize_weights()
     
     def _make_residual_block(self, in_channels, out_channels, num_blocks, stride):
         """Crea un bloque de capas residuales."""
@@ -72,6 +85,9 @@ class Net(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def forward(self, x):
+        if self.pretrained:
+            return self.backbone(x)
+            
         # Entrada: (N, 3, 224, 224)
         
         # Bloque inicial
