@@ -68,23 +68,31 @@ class AsyncDistributedTrainingServer:
     """
 
     def __init__(self, host, port, num_workers, epocas, learning_rate,
-                 hf_token, split='train', shard_size=10000, splitting_n=None):
+                 hf_token, split='train', shard_size=10000, splitting_n=None,
+                 pretrained=False, freeze_backbone=False):
         self.host = host
         self.port = port
         self.num_workers = num_workers
         self.epocas = epocas
-        self.learning_rate = learning_rate
         self.hf_token = hf_token
         self.split = split
 
+        # If fine-tuning a pretrained model (no freeze) and learning rate is the default 0.01,
+        # adjust default to 0.0001 (1e-4) to avoid disrupting pretrained weights.
+        if pretrained and not freeze_backbone and learning_rate == 0.01:
+            print("  ℹ Fine-tuning pretrained model: adjusting learning rate to 0.0001 (1e-4)")
+            self.learning_rate = 0.0001
+        else:
+            self.learning_rate = learning_rate
+
         # ── Model ────────────────────────────────────────────────────────
-        self.net = Net(num_classes=NUM_CLASSES)
+        self.net = Net(num_classes=NUM_CLASSES, pretrained=pretrained, freeze_backbone=freeze_backbone)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net.to(self.device)
 
         self.optimizer = optim.SGD(
-            self.net.parameters(),
-            lr=learning_rate,
+            filter(lambda p: p.requires_grad, self.net.parameters()),
+            lr=self.learning_rate,
             momentum=0.9,
             weight_decay=1e-2
         )
@@ -145,6 +153,13 @@ class AsyncDistributedTrainingServer:
         self.historial_intervalo_epochs = []
         self.historial_intervalo_times = []
         self.historial_intervalo_loss = []
+        self.historial_intervalo_acc_train = []
+
+        # Historial de pasos (step-level, one entry per global update point)
+        self.step_loss_history = []
+        self.step_accuracy_history = []
+        self.step_times_history = []
+        self.step_ids_history = []
 
         # ── Training is done flag ────────────────────────────────────────
         self.training_done = False
@@ -383,6 +398,14 @@ class AsyncDistributedTrainingServer:
                         current_epoch = (self.global_step // self.steps_per_epoch) + 1
                         step_in_ep = (self.global_step % self.steps_per_epoch) + 1
 
+                        total_time = time.time() - self.training_start
+
+                        # Registrar métricas a nivel de paso (step-level)
+                        self.step_loss_history.append(round(avg_loss, 6))
+                        self.step_accuracy_history.append(round(avg_acc, 6))
+                        self.step_times_history.append(round(total_time, 6))
+                        self.step_ids_history.append([current_epoch, step_in_ep])
+
                         print(f"\n  {'─'*68}")
                         print(f"  GLOBAL UPDATE #{self.global_step + 1}/{self.total_updates} "
                               f"(Epoch {current_epoch}, Step {step_in_ep}/{self.steps_per_epoch})")
@@ -391,8 +414,7 @@ class AsyncDistributedTrainingServer:
                         print(f"  {'─'*68}\n")
 
                         # Evaluate / log at epoch boundaries
-                        total_time = time.time() - self.training_start
-                        self.evaluate_global_model(current_epoch, total_time, avg_loss)
+                        self.evaluate_global_model(current_epoch, total_time, avg_loss, avg_acc)
 
                         # Increment global step
                         self.global_step += 1
@@ -510,7 +532,7 @@ class AsyncDistributedTrainingServer:
     # EVALUATION / LOGGING
     # ─────────────────────────────────────────────────────────────────────
 
-    def evaluate_global_model(self, epoch, tiempo_actual, avg_loss):
+    def evaluate_global_model(self, epoch, tiempo_actual, avg_loss, avg_acc):
         """Log epoch-level metrics."""
         if epoch % INTERVALO_LOG == 0 or epoch == 1:
             # Only log once per epoch (avoid duplicates from multiple updates in same epoch)
@@ -518,11 +540,12 @@ class AsyncDistributedTrainingServer:
                 self.historial_intervalo_epochs.append(epoch)
                 self.historial_intervalo_times.append(round(tiempo_actual, 6))
                 self.historial_intervalo_loss.append(round(avg_loss, 6))
+                self.historial_intervalo_acc_train.append(round(avg_acc, 6))
 
                 print(f"\n  {'─'*68}")
                 print(f"  EVALUACIÓN GLOBAL — ÉPOCA {epoch}/{self.epocas}")
                 print(f"  {'─'*68}")
-                print(f"    ✓ GLOBAL → Loss: {avg_loss:.4f}")
+                print(f"    ✓ GLOBAL → Loss: {avg_loss:.4f} | Acc (train): {avg_acc:.2f}%")
                 print(f"    ⏱ Tiempo acumulado: {tiempo_actual:.2f}s")
 
     # ─────────────────────────────────────────────────────────────────────
@@ -583,6 +606,10 @@ class AsyncDistributedTrainingServer:
                 epocas=self.epocas,
                 learning_rate=self.learning_rate,
                 training_time=tiempo_total,
+                step_loss_history=self.step_loss_history,
+                step_accuracy_history=self.step_accuracy_history,
+                step_times_history=self.step_times_history,
+                step_ids_history=self.step_ids_history,
                 info_extra={
                     'num_workers': self.num_workers,
                     'architecture': 'ImageNet ResNet - Async-SGD with Sockets',
@@ -594,6 +621,7 @@ class AsyncDistributedTrainingServer:
                     'historial_intervalo_epochs': self.historial_intervalo_epochs,
                     'historial_intervalo_times': self.historial_intervalo_times,
                     'historial_intervalo_loss': self.historial_intervalo_loss,
+                    'historial_intervalo_acc_train': self.historial_intervalo_acc_train,
                     'model_path': model_path,
                     'dataset_split': self.split,
                     'num_classes': NUM_CLASSES,
@@ -616,11 +644,12 @@ class AsyncDistributedTrainingServer:
 
 
 def start_server(host, port, num_workers, epocas, learning_rate,
-                 hf_token, split, shard_size, splitting_n):
+                 hf_token, split, shard_size, splitting_n, pretrained, freeze_backbone):
     """Inicia el servidor de entrenamiento distribuido async."""
     server = AsyncDistributedTrainingServer(
         host, port, num_workers, epocas, learning_rate,
-        hf_token, split, shard_size, splitting_n
+        hf_token, split, shard_size, splitting_n,
+        pretrained=pretrained, freeze_backbone=freeze_backbone
     )
     server.setup_socket_server()
     server.wait_for_workers()
@@ -689,6 +718,16 @@ if __name__ == '__main__':
              "Default: n=λ (Downpour ASGD, c=1). "
              "n=1 da SGD síncrono (c=λ).",
     )
+    parser.add_argument(
+        "--pretrained",
+        action="store_true",
+        help="Usar un modelo ResNet-18 preentrenado",
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="Congelar los pesos del feature extractor (backbone) en el modelo preentrenado",
+    )
 
     args = parser.parse_args()
 
@@ -702,4 +741,6 @@ if __name__ == '__main__':
         args.split,
         args.shard_size,
         args.splitting_n,
+        args.pretrained,
+        args.freeze_backbone,
     )

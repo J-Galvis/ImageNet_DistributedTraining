@@ -53,14 +53,14 @@ class DistributedTrainingWorker:
     Se conecta al servidor y entrena los batches asignados del shard ImageNet.
     """
     
-    def __init__(self, server_host, server_port, imagenet_split='train'):
+    def __init__(self, server_host, server_port, imagenet_split='train', pretrained=False, freeze_backbone=False):
         self.server_host = server_host
         self.server_port = server_port
         self.imagenet_split = imagenet_split
         self.hf_token = None  # Will be received from server
         
         # Modelo
-        self.net = Net(num_classes=NUM_CLASSES)
+        self.net = Net(num_classes=NUM_CLASSES, pretrained=pretrained, freeze_backbone=freeze_backbone)
         self.criterion = nn.CrossEntropyLoss()
         
         # Datos
@@ -245,6 +245,7 @@ class DistributedTrainingWorker:
                     p.grad is None or torch.isfinite(p.grad).all()
                     for p in self.net.parameters()
                 )
+                self.scaler.step(self._amp_optimizer)
                 self.scaler.update()
             else:
                 # En CPU o sin AMP
@@ -392,9 +393,12 @@ class DistributedTrainingWorker:
                 pass
 
 
-def start_worker(server_host, server_port, imagenet_split):
+def start_worker(server_host, server_port, imagenet_split, pretrained, freeze_backbone):
     """Inicia el worker de entrenamiento distribuido"""
-    worker = DistributedTrainingWorker(server_host, server_port, imagenet_split)
+    worker = DistributedTrainingWorker(
+        server_host, server_port, imagenet_split,
+        pretrained=pretrained, freeze_backbone=freeze_backbone
+    )
     
     try:
         worker.connect_to_server()
@@ -433,7 +437,17 @@ if __name__ == "__main__":
         choices=['train', 'val'],
         help="Split de ImageNet a usar (por defecto: train)",
     )
+    parser.add_argument(
+        "--pretrained",
+        action="store_true",
+        help="Usar un modelo ResNet-18 preentrenado",
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="Congelar los pesos del feature extractor (backbone) en el modelo preentrenado",
+    )
 
     args = parser.parse_args()
 
-    start_worker(args.host, args.port, args.split)
+    start_worker(args.host, args.port, args.split, args.pretrained, args.freeze_backbone)
