@@ -123,10 +123,17 @@ class DistributedTrainingServer:
         # Datos sobre particiones
         self.shard_sizes = SHARD_SIZE  
         
-        # Historial de checkpoints
+        # Historial de checkpoints (epoch-level)
         self.historial_intervalo_epochs = []
         self.historial_intervalo_times = []
         self.historial_intervalo_loss = []
+        self.historial_intervalo_acc_train = []
+        
+        # Historial de pasos (step-level, one entry per synchronization point)
+        self.step_loss_history = []
+        self.step_accuracy_history = []
+        self.step_times_history = []
+        self.step_ids_history = []
     
 
     def setup_socket_server(self):
@@ -422,7 +429,7 @@ class DistributedTrainingServer:
         self.net.load_state_dict(new_state)
         print(f"    ℹ Server: BN running stats sincronizadas desde {len(all_bufs)} workers")
     
-    def evaluate_global_model(self, epoch, tiempo_actual, avg_loss):
+    def evaluate_global_model(self, epoch, tiempo_actual, avg_loss, avg_epoch_acc=None):
         """
         Evalúa el modelo global y guarda métricas en historial.
         
@@ -430,16 +437,21 @@ class DistributedTrainingServer:
             epoch: int, número de época actual
             tiempo_actual: float, tiempo transcurrido desde el inicio del entrenamiento
             avg_loss: float, pérdida promedio de la época
+            avg_epoch_acc: float, opcional, precisión promedio de la época
         """
         if epoch % INTERVALO_LOG == 0 or epoch == 1:
             self.historial_intervalo_epochs.append(epoch)
             self.historial_intervalo_times.append(round(tiempo_actual, 6))
             self.historial_intervalo_loss.append(round(avg_loss, 6))
+            if avg_epoch_acc is not None:
+                self.historial_intervalo_acc_train.append(round(avg_epoch_acc, 6))
             
             print(f"\n  {'─'*68}")
             print(f"  EVALUACIÓN GLOBAL — ÉPOCA {epoch}/{self.epocas}")
             print(f"  {'─'*68}")
             print(f"    ✓ GLOBAL → Loss: {avg_loss:.4f}")
+            if avg_epoch_acc is not None:
+                print(f"    ✓ GLOBAL → Accuracy: {avg_epoch_acc:.2f}%")
             print(f"    ⏱ Tiempo acumulado: {tiempo_actual:.2f}s")
     
     def training_loop(self):
@@ -490,6 +502,12 @@ class DistributedTrainingServer:
                     # los buffers de BatchNorm actualizados a todos los workers.
                     self.apply_worker_buffers(messages)
                     
+                    # Registrar métricas a nivel de paso (step-level)
+                    self.step_loss_history.append(round(avg_loss, 6))
+                    self.step_accuracy_history.append(round(avg_acc, 6))
+                    self.step_times_history.append(round(time.time() - training_start, 6))
+                    self.step_ids_history.append([epoch, step])
+                    
                     # Log del paso
                     step_time = time.time() - epoch_start
                     print(f"    ✓ Paso {step+1}/{self.steps_per_epoch} completado "
@@ -502,7 +520,7 @@ class DistributedTrainingServer:
                 avg_epoch_acc = sum(epoch_accs) / len(epoch_accs) if epoch_accs else 0.0
                 
                 # Registrar métricas en historial
-                self.evaluate_global_model(epoch, total_time, avg_epoch_loss)
+                self.evaluate_global_model(epoch, total_time, avg_epoch_loss, avg_epoch_acc)
                 
                 print(f"  Epoch {epoch} completada en {epoch_time:.4f}s "
                       f"(Total: {total_time:.4f}s | Acc: {avg_epoch_acc:.2f}%)\n")
@@ -529,6 +547,10 @@ class DistributedTrainingServer:
                 epocas=self.epocas,
                 learning_rate=self.learning_rate,
                 training_time=tiempo_total,
+                step_loss_history=self.step_loss_history,
+                step_accuracy_history=self.step_accuracy_history,
+                step_times_history=self.step_times_history,
+                step_ids_history=self.step_ids_history,
                 info_extra={
                     'num_workers': self.num_workers,
                     'architecture': 'ImageNet ResNet - Distributed with Sockets',
@@ -538,6 +560,7 @@ class DistributedTrainingServer:
                     'historial_intervalo_epochs': self.historial_intervalo_epochs,
                     'historial_intervalo_times': self.historial_intervalo_times,
                     'historial_intervalo_loss': self.historial_intervalo_loss,
+                    'historial_intervalo_acc_train': self.historial_intervalo_acc_train,
                     'model_path': model_path,
                     'dataset_split': self.split,
                     'num_classes': NUM_CLASSES,

@@ -15,7 +15,9 @@ CARPETA_STATS = os.path.join(os.path.dirname(__file__), '../stats')
 # ─────────────────────────────────────────────────────────────────────────────
 
 def guardar_modelo(W1, b1, W2, b2, nombre_modelo, precision_test=None,
-                   epocas=None, learning_rate=None, training_time=None, info_extra=None):
+                   epocas=None, learning_rate=None, training_time=None, info_extra=None,
+                   step_loss_history=None, step_accuracy_history=None, 
+                   step_times_history=None, step_ids_history=None):
     """
     Guarda los pesos de una red neuronal entrenada en un archivo .pkl
     y los metadatos en un archivo JSON.
@@ -76,6 +78,15 @@ def guardar_modelo(W1, b1, W2, b2, nombre_modelo, precision_test=None,
     # Agregar información extra
     if info_extra:
         metadatos['info_extra'] = info_extra
+    
+    # Agregar métricas a nivel de paso (step-level) si están disponibles
+    if step_loss_history or step_accuracy_history or step_times_history or step_ids_history:
+        metadatos['step_metrics'] = {
+            'step_loss': step_loss_history if step_loss_history else [],
+            'step_accuracy': step_accuracy_history if step_accuracy_history else [],
+            'step_times': step_times_history if step_times_history else [],
+            'step_ids': step_ids_history if step_ids_history else [],
+        }
     
     # Guardar metadatos en JSON
     with open(ruta_archivo_json, 'w', encoding='utf-8') as archivo:
