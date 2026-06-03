@@ -29,7 +29,7 @@ from typing import Dict, List
 import argparse
 
 # Agregar el directorio padre al path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from defineNetwork import Net
 from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig, SHARD_SIZE
@@ -305,7 +305,11 @@ class AsyncDistributedTrainingServer:
 
                     # Snapshot weights and current global step
                     current_step = self.global_step
-                    params = self._snapshot_params()
+                    # Clone parameters on device quickly under lock to prevent lock contention
+                    gpu_params = {name: tensor.clone() for name, tensor in self.net.state_dict().items()}
+
+                # Convert to numpy outside the lock (handles GPU-CPU transfer and numpy allocation)
+                params = {name: tensor.cpu().numpy() for name, tensor in gpu_params.items()}
 
                 # ────── SEND WEIGHTS (outside lock for parallelism) ──────
                 # Compute which batches this worker should process
